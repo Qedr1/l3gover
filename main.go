@@ -1,19 +1,18 @@
+//go:build linux
+
+// L3-оверлей через TUN и UDP. IPv4-only. Без шифрования.
+// Батчи через ipv4.PacketConn ReadBatch/WriteBatch.
+// Батч ограничен таймером и целевым числом пакетов (≈128 KiB / MTU).
+// Эффективный MTU = min(cfg.Tun.MTU, link MTU интерфейса).
+// Корректный выход по Ctrl+C: TUN в non-blocking + poll(), UDP с короткими ReadDeadline.
+
 package main
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/binary"
-	"encoding/pem"
 	"errors"
 	"flag"
-	"io"
 	"log/slog"
-	"math/big"
 	"net"
 	"os"
 	"os/signal"
@@ -21,87 +20,62 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/BurntSushi/toml"
-	quic "github.com/quic-go/quic-go"
 	netlink "github.com/vishvananda/netlink"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/sys/unix"
 )
 
 // ======================= конфиг и типы =======================
 
-type Config struct {
+type Config struct { // настройки сервиса
 	Tun struct {
-		Name       string   `toml:"name"`
-		Addr       string   `toml:"addr"`
-		LinkMTU    int      `toml:"link_mtu"`
-		AddRoute   bool     `toml:"add_route"`
-		GrayRoutes []string `toml:"gray_routes"`
-		MTU        int      `toml:"mtu"`
+		Name       string   `toml:"name"`        // имя интерфейса
+		Addr       string   `toml:"addr"`        // IPv4 CIDR для TUN
+		LinkMTU    int      `toml:"link_mtu"`    // MTU интерфейса (>0 применить)
+		AddRoute   bool     `toml:"add_route"`   // добавить маршрут подсети Addr
+		GrayRoutes []string `toml:"gray_routes"` // доп. подсети → TUN
+		MTU        int      `toml:"mtu"`         // целевой MTU TUN I/O
 	} `toml:"tun"`
 	Transport struct {
-		Listen    string        `toml:"listen"`
-		ALPN      string        `toml:"alpn"`
-		Insecure  bool          `toml:"insecure"` // всегда true
-		Streams   int           `toml:"streams"`
-		UDPRcv    int           `toml:"udp_rbuf"`
-		UDPSnd    int           `toml:"udp_wbuf"`
-		Idle      time.Duration `toml:"idle"`
-		KeepAlive time.Duration `toml:"keepalive"`
+		Listen string `toml:"listen"`   // UDP адрес ip:port
+		UDPRcv int    `toml:"udp_rbuf"` // RX буфер сокета
+		UDPSnd int    `toml:"udp_wbuf"` // TX буфер сокета
 	} `toml:"transport"`
 	Map struct {
-		Path string `toml:"path"`
+		Path string `toml:"path"` // путь к TOML мэппингу
 	} `toml:"map"`
 	Batch struct {
-		Bytes int           `toml:"bytes"`    // минимум=MTU
-		Flush time.Duration `toml:"flush_ms"` // период флеша
+		Hold   time.Duration `toml:"hold"`   // макс. удержание батча
+		Warmup time.Duration `toml:"warmup"` // тёплый старт: флаш каждого пакета
 	} `toml:"batch"`
 	Log struct {
-		Level string `toml:"level"`
+		Level string `toml:"level"` // debug|info|warn|error
 	} `toml:"log"`
 }
 
 type peersTOML struct {
 	Peers map[string]string `toml:"peers"`
+} // "серый IPv4" = "белый host:port"
+
+type tunDevice struct { // один писатель в процессе
+	fd int
 }
 
-type tunDevice struct {
-	fd  int
-	wmu sync.Mutex
-}
-
-type peerMap struct {
+type peerMap struct { // IPv4(BE u32)→"ip:port"
 	mu sync.RWMutex
 	m  map[uint32]string
 }
 
-type streamState struct{ s *quic.Stream }
-
-type quicState struct {
-	conn *quic.Conn
-	ss   []streamState
-	rr   uint64
-	dead atomic.Bool
-	once sync.Once
-}
-
-type dialCache struct {
-	mu      sync.RWMutex
-	m       map[string]*quicState
-	pc      net.PacketConn
-	closing atomic.Bool
-	udpRcv  int
-	udpSnd  int
-}
-
-type batchAgg struct {
-	ep string
-	qs *quicState
-	st *streamState
-	b  []byte
+type udpState struct { // UDP сокет + PacketConn + кэш адресов
+	conn *net.UDPConn
+	pc   *ipv4.PacketConn
+	mu   sync.RWMutex
+	r4   map[string]*net.UDPAddr
 }
 
 // ======================= системные константы TUN =======================
@@ -153,51 +127,35 @@ func loadConfig(path string) (Config, error) {
 	if cfg.Transport.Listen == "" {
 		cfg.Transport.Listen = "0.0.0.0:5555"
 	}
-	if cfg.Transport.ALPN == "" {
-		cfg.Transport.ALPN = "go-l3-overlay"
-	}
-	if cfg.Transport.Streams < 1 {
-		cfg.Transport.Streams = 4
-	}
 	if cfg.Transport.UDPRcv == 0 {
-		cfg.Transport.UDPRcv = 16 << 20
+		cfg.Transport.UDPRcv = 32 << 20
 	}
 	if cfg.Transport.UDPSnd == 0 {
-		cfg.Transport.UDPSnd = 16 << 20
-	}
-	if cfg.Transport.Idle == 0 {
-		cfg.Transport.Idle = 10 * time.Minute
-	}
-	cfg.Transport.Insecure = true
-	// Батч по умолчанию: 256KiB и 10ms
-	if cfg.Batch.Bytes == 0 {
-		cfg.Batch.Bytes = 256 << 10
-	}
-	if cfg.Batch.Bytes < cfg.Tun.MTU {
-		cfg.Batch.Bytes = cfg.Tun.MTU
-	}
-	if cfg.Batch.Flush == 0 {
-		cfg.Batch.Flush = 10 * time.Millisecond
+		cfg.Transport.UDPSnd = 32 << 20
 	}
 	if cfg.Map.Path == "" {
 		cfg.Map.Path = "peers.toml"
 	}
+	if cfg.Batch.Hold == 0 {
+		cfg.Batch.Hold = 200 * time.Microsecond
+	}
+	if cfg.Batch.Warmup == 0 {
+		cfg.Batch.Warmup = 2 * time.Second
+	}
 	return cfg, nil
 }
 
-func clamp(x, lo, hi int) int {
-	if x < lo {
-		return lo
+func rip4(ip net.IP) uint32 {
+	b := ip.To4()
+	if b == nil {
+		return 0
 	}
-	if x > hi {
-		return hi
-	}
-	return x
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }
 
 // ============================= TUN I/O ================================
 
-func openTUN(name string) (*tunDevice, error) {
+func openTUN(name string) (*tunDevice, error) { // открыть TUN и сделать non-blocking
 	fd, err := syscall.Open("/dev/net/tun", syscall.O_RDWR, 0)
 	if err != nil {
 		return nil, errors.New("open /dev/net/tun: " + err.Error())
@@ -210,54 +168,60 @@ func openTUN(name string) (*tunDevice, error) {
 		_ = syscall.Close(fd)
 		return nil, errors.New("ioctl TUNSETIFF")
 	}
+	if err := unix.SetNonblock(fd, true); err != nil {
+		_ = syscall.Close(fd)
+		return nil, err
+	}
 	return &tunDevice{fd: fd}, nil
 }
 
-func (t *tunDevice) Read(p []byte) (int, error) { return syscall.Read(t.fd, p) }
-func (t *tunDevice) Write(p []byte) (int, error) {
-	t.wmu.Lock()
-	defer t.wmu.Unlock()
-	return syscall.Write(t.fd, p)
+func (t *tunDevice) ReadNB(p []byte) (int, error) { // неблокирующее чтение
+	n, err := syscall.Read(t.fd, p)
+	if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+		return 0, nil
+	}
+	return n, err
 }
-func (t *tunDevice) Close() error { return syscall.Close(t.fd) }
 
-func configureTUN(name, cidr string, linkMTU int, addRoute bool) error {
+func (t *tunDevice) Write(p []byte) (int, error) { return syscall.Write(t.fd, p) }
+func (t *tunDevice) Close() error                { return syscall.Close(t.fd) }
+
+func configureTUN(name, cidr string, linkMTU int, addRoute bool) (int, error) {
 	link, err := netlink.LinkByName(name)
 	if err != nil {
-		return errors.New("link not found: " + err.Error())
+		return 0, errors.New("link not found: " + err.Error())
 	}
 	if linkMTU > 0 {
 		if err := netlink.LinkSetMTU(link, linkMTU); err != nil {
-			return errors.New("set mtu: " + err.Error())
+			return 0, errors.New("set mtu: " + err.Error())
 		}
 	}
 	if err := netlink.LinkSetUp(link); err != nil {
-		return errors.New("link up: " + err.Error())
+		return 0, errors.New("link up: " + err.Error())
 	}
-	if cidr == "" {
-		return nil
-	}
-	ip, ipnet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return errors.New("addr parse: " + err.Error())
-	}
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return errors.New("IPv4 only")
-	}
-	addr := &netlink.Addr{IPNet: &net.IPNet{IP: ip4, Mask: ipnet.Mask}}
-	if err := netlink.AddrReplace(link, addr); err != nil {
-		return errors.New("addr set: " + err.Error())
-	}
-	if addRoute {
-		netIP := ip4.Mask(ipnet.Mask)
-		dst := &net.IPNet{IP: netIP, Mask: ipnet.Mask}
-		rt := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}
-		if err := netlink.RouteReplace(rt); err != nil {
-			return errors.New("route add: " + err.Error())
+	if cidr != "" {
+		ip, ipnet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return 0, errors.New("addr parse: " + err.Error())
+		}
+		ip4 := ip.To4()
+		if ip4 == nil {
+			return 0, errors.New("IPv4 only")
+		}
+		addr := &netlink.Addr{IPNet: &net.IPNet{IP: ip4, Mask: ipnet.Mask}}
+		if err := netlink.AddrReplace(link, addr); err != nil {
+			return 0, errors.New("addr set: " + err.Error())
+		}
+		if addRoute {
+			dst := &net.IPNet{IP: ip4.Mask(ipnet.Mask), Mask: ipnet.Mask}
+			rt := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}
+			if err := netlink.RouteReplace(rt); err != nil {
+				return 0, errors.New("route add: " + err.Error())
+			}
 		}
 	}
-	return nil
+	link, _ = netlink.LinkByName(name)
+	return link.Attrs().MTU, nil
 }
 
 func addGrayRoutes(tunName string, cidrs []string) error {
@@ -302,12 +266,15 @@ func (pm *peerMap) loadFromTOML(path string) error {
 		if ip == nil || ip.To4() == nil {
 			return errors.New("map: IPv4 required: " + gray)
 		}
-		raddr, err := net.ResolveUDPAddr("udp", strings.TrimSpace(white))
-		if err != nil || raddr == nil || raddr.IP == nil {
+		host, port, err := net.SplitHostPort(strings.TrimSpace(white))
+		if err != nil {
 			return errors.New("map: host:port invalid for " + gray)
 		}
-		key := binary.BigEndian.Uint32(ip.To4())
-		tmp[key] = net.JoinHostPort(raddr.IP.String(), strconv.Itoa(raddr.Port))
+		rip, err := net.ResolveIPAddr("ip", host)
+		if err != nil || rip == nil || rip.IP == nil || rip.IP.To4() == nil {
+			return errors.New("map: host invalid for " + gray)
+		}
+		tmp[rip4(ip)] = net.JoinHostPort(rip.IP.String(), port)
 	}
 	pm.mu.Lock()
 	pm.m = tmp
@@ -319,7 +286,7 @@ func (pm *peerMap) lookup(dstIPv4 []byte) (string, bool) {
 	if len(dstIPv4) != 4 {
 		return "", false
 	}
-	key := binary.BigEndian.Uint32(dstIPv4)
+	key := uint32(dstIPv4[0])<<24 | uint32(dstIPv4[1])<<16 | uint32(dstIPv4[2])<<8 | uint32(dstIPv4[3])
 	pm.mu.RLock()
 	v, ok := pm.m[key]
 	pm.mu.RUnlock()
@@ -341,295 +308,65 @@ func (pm *peerMap) endpoints() []string {
 	return out
 }
 
-// ============================= фрейминг ==============================
-
-func writeFrame(dst io.Writer, payload []byte) error {
-	if len(payload) > 0xFFFF {
-		return errors.New("frame too large")
-	}
-	var hdr [2]byte
-	binary.BigEndian.PutUint16(hdr[:], uint16(len(payload)))
-	if _, err := dst.Write(hdr[:]); err != nil {
-		return err
-	}
-	_, err := dst.Write(payload)
-	return err
-}
-
-func readFrame(src io.Reader, buf []byte) (int, error) {
-	var hdr [2]byte
-	if _, err := io.ReadFull(src, hdr[:]); err != nil {
-		return 0, err
-	}
-	ln := int(binary.BigEndian.Uint16(hdr[:]))
-	if ln > len(buf) {
-		return 0, errors.New("incoming frame larger than buffer")
-	}
-	_, err := io.ReadFull(src, buf[:ln])
-	return ln, err
-}
-
 // ============================= IPv4 utils ============================
 
 func ipv4Dst(pkt []byte) ([]byte, bool) {
 	if len(pkt) < 20 {
 		return nil, false
 	}
-	vihl := pkt[0]
-	if vihl>>4 != 4 {
+	if pkt[0]>>4 != 4 {
 		return nil, false
 	}
-	ihl := int(vihl&0x0F) * 4
+	ihl := int(pkt[0]&0x0F) * 4
 	if ihl < 20 || len(pkt) < ihl {
 		return nil, false
 	}
 	return pkt[16:20], true
 }
 
-// ============================= QUIC state ============================
+// =============================== UDP ================================
 
-func (qs *quicState) pick() *streamState {
-	i := atomic.AddUint64(&qs.rr, 1)
-	return &qs.ss[i%uint64(len(qs.ss))]
+func newUDP(listen string, rcv, snd int) (*udpState, error) {
+	laddr, err := net.ResolveUDPAddr("udp", listen)
+	if err != nil {
+		return nil, err
+	}
+	c, err := net.ListenUDP("udp", laddr)
+	if err != nil {
+		return nil, err
+	}
+	_ = c.SetReadBuffer(rcv)
+	_ = c.SetWriteBuffer(snd)
+	return &udpState{conn: c, pc: ipv4.NewPacketConn(c), r4: make(map[string]*net.UDPAddr)}, nil
 }
 
-// =========================== кэш QUIC-клиента ========================
+func (u *udpState) close() { _ = u.pc.Close(); _ = u.conn.Close() }
 
-func newDialCache(udpRcv, udpSnd int) *dialCache {
-	return &dialCache{m: make(map[string]*quicState), udpRcv: udpRcv, udpSnd: udpSnd}
-}
-
-func (dc *dialCache) ensureClientPC() error {
-	dc.mu.RLock()
-	if dc.pc != nil {
-		dc.mu.RUnlock()
-		return nil
+func (u *udpState) raddr(ep string) (*net.UDPAddr, error) {
+	u.mu.RLock()
+	if a, ok := u.r4[ep]; ok {
+		u.mu.RUnlock()
+		return a, nil
 	}
-	dc.mu.RUnlock()
-	dc.mu.Lock()
-	defer dc.mu.Unlock()
-	if dc.pc != nil {
-		return nil
-	}
-	c, err := net.ListenPacket("udp", ":0")
-	if err != nil {
-		return err
-	}
-	if uc, ok := c.(*net.UDPConn); ok {
-		_ = uc.SetReadBuffer(dc.udpRcv)
-		_ = uc.SetWriteBuffer(dc.udpSnd)
-	}
-	dc.pc = c
-	return nil
-}
-
-func (dc *dialCache) getOrDial(ctx context.Context, endpoint, alpn string, insecure bool, streamCount int, qconf *quic.Config) (*quicState, error) {
-	dc.mu.RLock()
-	if qs, ok := dc.m[endpoint]; ok && !qs.dead.Load() {
-		dc.mu.RUnlock()
-		return qs, nil
-	}
-	dc.mu.RUnlock()
-	if dc.closing.Load() {
-		return nil, errors.New("dial cache closing")
-	}
-	if err := dc.ensureClientPC(); err != nil {
-		return nil, err
-	}
-
-	host, _, err := net.SplitHostPort(endpoint)
+	u.mu.RUnlock()
+	host, portStr, err := net.SplitHostPort(ep)
 	if err != nil {
 		return nil, err
 	}
-	tlsConf := &tls.Config{NextProtos: []string{alpn}, InsecureSkipVerify: insecure, ServerName: host, MinVersion: tls.VersionTLS13}
-	raddr, err := net.ResolveUDPAddr("udp", endpoint)
-	if err != nil {
-		return nil, err
+	rip, err := net.ResolveIPAddr("ip", host)
+	if err != nil || rip == nil || rip.IP == nil || rip.IP.To4() == nil {
+		return nil, errors.New("resolve: " + ep)
 	}
-	conn, err := quic.Dial(ctx, dc.pc, raddr, tlsConf, qconf)
-	if err != nil {
-		return nil, err
-	}
-
-	if streamCount < 1 {
-		streamCount = 1
-	}
-	ss := make([]streamState, streamCount)
-	for i := range ss {
-		s, err := conn.OpenStreamSync(ctx)
-		if err != nil {
-			_ = conn.CloseWithError(0, "open stream fail")
-			return nil, err
-		}
-		ss[i] = streamState{s: s}
-	}
-	qs := &quicState{conn: conn, ss: ss}
-
-	dc.mu.Lock()
-	if old, ok := dc.m[endpoint]; ok && !old.dead.Load() {
-		dc.mu.Unlock()
-		_ = conn.CloseWithError(0, "duplicate")
+	port, _ := strconv.Atoi(portStr)
+	addr := &net.UDPAddr{IP: rip.IP, Port: port}
+	u.mu.Lock()
+	if old, ok := u.r4[ep]; ok {
+		u.mu.Unlock()
 		return old, nil
 	}
-	dc.m[endpoint] = qs
-	dc.mu.Unlock()
-	return qs, nil
-}
-
-func (dc *dialCache) registerIncomingConn(endpoint string, conn *quic.Conn, streamCount int) *quicState {
-	if streamCount < 1 {
-		streamCount = 1
-	}
-	ss := make([]streamState, streamCount)
-	for i := range ss {
-		s, err := conn.OpenStreamSync(context.Background())
-		if err != nil {
-			break
-		}
-		ss[i] = streamState{s: s}
-	}
-	qs := &quicState{conn: conn, ss: ss}
-	dc.mu.Lock()
-	if old, ok := dc.m[endpoint]; ok {
-		old.dead.Store(true)
-	}
-	dc.m[endpoint] = qs
-	dc.mu.Unlock()
-	go func() { <-conn.Context().Done(); dc.drop(endpoint) }()
-	return qs
-}
-
-func dialWithRetry(ctx context.Context, dc *dialCache, ep, alpn string, insecure bool, streams int, qconf *quic.Config) (*quicState, error) {
-	attempt := 0
-	for {
-		attempt++
-		dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		qs, err := dc.getOrDial(dctx, ep, alpn, insecure, streams, qconf)
-		cancel()
-		if err == nil {
-			slog.Info("dial ok", "endpoint", ep, "attempt", attempt)
-			return qs, nil
-		}
-		slog.Warn("dial retry", "endpoint", ep, "attempt", attempt, "err", err)
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(1 * time.Second):
-		}
-	}
-}
-
-func (dc *dialCache) drop(endpoint string) {
-	dc.mu.Lock()
-	qs, ok := dc.m[endpoint]
-	if ok {
-		delete(dc.m, endpoint)
-	}
-	dc.mu.Unlock()
-	if !ok {
-		return
-	}
-	qs.dead.Store(true)
-	for i := range qs.ss {
-		_ = qs.ss[i].s.Close()
-	}
-	_ = qs.conn.CloseWithError(0, "drop")
-}
-
-func (dc *dialCache) close() {
-	dc.closing.Store(true)
-	dc.mu.Lock()
-	pc := dc.pc
-	dc.pc = nil
-	m := dc.m
-	dc.m = make(map[string]*quicState)
-	dc.mu.Unlock()
-	if pc != nil {
-		_ = pc.Close()
-	}
-	for _, qs := range m {
-		qs.dead.Store(true)
-		for i := range qs.ss {
-			_ = qs.ss[i].s.Close()
-		}
-		_ = qs.conn.CloseWithError(0, "shutdown")
-	}
-}
-
-// ============================ TLS/QUIC cfg ============================
-
-func generateServerTLS(alpn string) (*tls.Config, error) {
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return nil, err
-	}
-	serial, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
-	tmpl := x509.Certificate{
-		SerialNumber: serial, Subject: pkix.Name{CommonName: "go-l3-overlay"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
-	if err != nil {
-		return nil, err
-	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return nil, err
-	}
-	return &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{alpn}, MinVersion: tls.VersionTLS13}, nil
-}
-
-func quicConfig(idle, keepalive time.Duration) *quic.Config {
-	cfg := &quic.Config{
-		MaxIdleTimeout:                 idle,
-		InitialStreamReceiveWindow:     32 << 20,
-		InitialConnectionReceiveWindow: 128 << 20,
-	}
-	if keepalive > 0 {
-		cfg.KeepAlivePeriod = keepalive
-	}
-	return cfg
-}
-
-// ======================== обработка conn (rx→TUN) =====================
-
-func serveQUICConn(conn *quic.Conn, tun *tunDevice, mtu int) {
-	remote := conn.RemoteAddr().String()
-	slog.Info("serve conn", "remote", remote)
-	for {
-		str, err := conn.AcceptStream(context.Background())
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				slog.Warn("accept stream", "remote", remote, "err", err)
-			}
-			return
-		}
-		go func(s *quic.Stream) {
-			defer s.Close()
-			buf := make([]byte, mtu)
-			for {
-				ln, err := readFrame(s, buf)
-				if err != nil {
-					if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-						slog.Warn("read frame", "remote", remote, "err", err)
-					}
-					return
-				}
-				if ln <= 0 {
-					continue
-				}
-				if _, err := tun.Write(buf[:ln]); err != nil {
-					slog.Warn("tun write", "err", err)
-					return
-				}
-			}
-		}(str)
-	}
+	u.r4[ep] = addr
+	u.mu.Unlock()
+	return addr, nil
 }
 
 // =============================== main ================================
@@ -645,38 +382,23 @@ func main() {
 		slog.Error("config load", "err", err)
 		os.Exit(1)
 	}
-
-	// для throughput-замеров держим INFO
 	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(cfg.Log.Level)})
 	slog.SetDefault(slog.New(h))
-	slog.Info("start",
-		"listen", cfg.Transport.Listen, "alpn", cfg.Transport.ALPN, "streams", cfg.Transport.Streams,
-		"udp_rbuf", cfg.Transport.UDPRcv, "udp_wbuf", cfg.Transport.UDPSnd,
-		"mtu", cfg.Tun.MTU, "batch_bytes", cfg.Batch.Bytes, "batch_flush", cfg.Batch.Flush,
-		"tun", cfg.Tun.Name, "insecure", cfg.Transport.Insecure,
-	)
 
-	// Пулы
-	var batchPool sync.Pool
-	batchPool.New = func() any { return make([]byte, 0, cfg.Batch.Bytes) }
-	var rbufPool sync.Pool
-	rbufPool.New = func() any { return make([]byte, cfg.Tun.MTU) }
-
-	// Маппинг
 	pm := newPeerMap()
 	if err := pm.loadFromTOML(cfg.Map.Path); err != nil {
 		slog.Error("map load", "err", err)
 		os.Exit(1)
 	}
 
-	// TUN
 	tun, err := openTUN(cfg.Tun.Name)
 	if err != nil {
 		slog.Error("tun open", "err", err)
 		os.Exit(1)
 	}
 	defer tun.Close()
-	if err := configureTUN(cfg.Tun.Name, cfg.Tun.Addr, cfg.Tun.LinkMTU, cfg.Tun.AddRoute); err != nil {
+	linkMTU, err := configureTUN(cfg.Tun.Name, cfg.Tun.Addr, cfg.Tun.LinkMTU, cfg.Tun.AddRoute)
+	if err != nil {
 		slog.Error("tun configure", "err", err)
 		os.Exit(1)
 	}
@@ -685,197 +407,188 @@ func main() {
 		os.Exit(1)
 	}
 
-	// UDP
-	laddr, err := net.ResolveUDPAddr("udp", cfg.Transport.Listen)
-	if err != nil {
-		slog.Error("resolve listen", "err", err)
-		os.Exit(1)
+	effMTU := cfg.Tun.MTU
+	if linkMTU > 0 && linkMTU < effMTU {
+		effMTU = linkMTU
 	}
-	udpConn, err := net.ListenUDP("udp", laddr)
+	if effMTU < 576 {
+		effMTU = 576
+	}
+
+	udp, err := newUDP(cfg.Transport.Listen, cfg.Transport.UDPRcv, cfg.Transport.UDPSnd)
 	if err != nil {
 		slog.Error("udp listen", "err", err)
 		os.Exit(1)
 	}
-	defer udpConn.Close()
-	_ = udpConn.SetReadBuffer(cfg.Transport.UDPRcv)
-	_ = udpConn.SetWriteBuffer(cfg.Transport.UDPSnd)
+	defer udp.close()
 
-	// QUIC
-	srvTLS, err := generateServerTLS(cfg.Transport.ALPN)
-	if err != nil {
-		slog.Error("tls", "err", err)
-		os.Exit(1)
-	}
-	qconf := quicConfig(cfg.Transport.Idle, cfg.Transport.KeepAlive)
-	listener, err := quic.Listen(udpConn, srvTLS, qconf)
-	if err != nil {
-		slog.Error("quic listen", "err", err)
-		os.Exit(1)
-	}
-	defer listener.Close()
+	slog.Info("start",
+		"listen", cfg.Transport.Listen,
+		"udp_rbuf", cfg.Transport.UDPRcv, "udp_wbuf", cfg.Transport.UDPSnd,
+		"cfg_mtu", cfg.Tun.MTU, "link_mtu", linkMTU, "eff_mtu", effMTU,
+		"hold", cfg.Batch.Hold, "warmup", cfg.Batch.Warmup,
+		"tun", cfg.Tun.Name,
+	)
 
-	dc := newDialCache(cfg.Transport.UDPRcv, cfg.Transport.UDPSnd)
-	defer dc.close()
-
+	// Завершение по сигналу
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go func() { <-ctx.Done(); _ = listener.Close(); _ = tun.Close(); dc.close() }()
 
-	go func() {
-		for {
-			conn, err := listener.Accept(ctx)
-			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				slog.Warn("accept", "err", err)
-				continue
-			}
-			ep := conn.RemoteAddr().String()
-			slog.Info("accept ok", "remote", ep)
-			qs := dc.registerIncomingConn(ep, conn, cfg.Transport.Streams)
-			qs.once.Do(func() { go serveQUICConn(qs.conn, tun, cfg.Tun.MTU) })
-		}
-	}()
+	// Прогрев: предразрешение адресов и мини-датаграммы
+	prewarmEndpoints(udp, pm)
 
-	for _, ep := range pm.endpoints() {
-		ep := ep
-		go func() {
-			for {
-				if ctx.Err() != nil {
-					return
-				}
-				qs, err := dialWithRetry(ctx, dc, ep, cfg.Transport.ALPN, cfg.Transport.Insecure, cfg.Transport.Streams, qconf)
-				if err != nil {
-					return
-				}
-				qs.once.Do(func() { go serveQUICConn(qs.conn, tun, cfg.Tun.MTU) })
-				select {
-				case <-ctx.Done():
-					return
-				case <-qs.conn.Context().Done():
-					slog.Warn("conn closed", "endpoint", ep)
-					dc.drop(ep)
-					time.Sleep(1 * time.Second)
-				}
-			}
-		}()
+	// Лимиты батча
+	const targetBatchBytes = 128 << 10
+	pktLimit := targetBatchBytes / effMTU
+	if pktLimit < 1 {
+		pktLimit = 1
+	}
+	if pktLimit > 256 {
+		pktLimit = 256
 	}
 
-	pktCap := clamp((cfg.Batch.Bytes/cfg.Tun.MTU)*4, 64, 4096)
-	pktCh := make(chan []byte, pktCap)
-	slog.Info("pkt channel", "cap", pktCap)
-
-	flushTicker := time.NewTicker(cfg.Batch.Flush)
-	defer flushTicker.Stop()
-
-	// RX TUN → канал
+	// ================= RX: UDP → TUN =================
 	go func() {
-		defer close(pktCh)
-		for {
-			b := rbufPool.Get().([]byte)
-			if cap(b) < cfg.Tun.MTU {
-				b = make([]byte, cfg.Tun.MTU)
-			}
-			n, err := tun.Read(b[:cfg.Tun.MTU])
-			if err != nil {
-				if ctx.Err() == nil && !errors.Is(err, syscall.EINTR) {
-					slog.Error("tun read", "err", err)
-				}
-				return
-			}
-			pktCh <- b[:n]
+		N := clamp(pktLimit*2, 64, 512)
+		msgs := make([]ipv4.Message, N)
+		bufs := make([][]byte, N)
+		for i := 0; i < N; i++ {
+			bufs[i] = make([]byte, effMTU)
+			msgs[i].Buffers = [][]byte{bufs[i]}
 		}
-	}()
 
-	var cur batchAgg
-
-	// запись батча; при ошибке — мягкий recovery на новом стриме
-	writeBatch := func(buf []byte) {
-		// попытка записи
-		if _, err := cur.st.s.Write(buf); err != nil {
-			// если conn жив, пробуем новый стрим и однократный повтор
-			if cur.qs != nil && cur.qs.conn.Context().Err() == nil {
-				if ns, e2 := cur.qs.conn.OpenStreamSync(context.Background()); e2 == nil {
-					cur.st = &streamState{s: ns}
-					if _, e3 := cur.st.s.Write(buf); e3 == nil {
+		for {
+			_ = udp.pc.SetReadDeadline(time.Now().Add(200 * time.Millisecond)) // короткий таймаут
+			n, err := udp.pc.ReadBatch(msgs, 0)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					continue
+				}
+				if ne, ok := err.(net.Error); ok && ne.Temporary() {
+					continue
+				}
+				time.Sleep(200 * time.Microsecond)
+				continue
+			}
+			for i := 0; i < n; i++ {
+				ln := msgs[i].N
+				if ln <= 0 || ln > effMTU {
+					continue
+				}
+				if _, err := tun.Write(bufs[i][:ln]); err != nil {
+					if ctx.Err() != nil {
 						return
 					}
 				}
 			}
-			// conn мёртв — дропаем
-			slog.Warn("batch send", "endpoint", cur.ep, "err", err)
-			dc.drop(cur.ep)
-			cur = batchAgg{}
 		}
-	}
+	}()
 
-	flushCur := func() {
-		if len(cur.b) == 0 || cur.st == nil {
-			return
-		}
-		buf := cur.b
-		cur.b = batchPool.Get().([]byte)[:0]
-		writeBatch(buf)
-		batchPool.Put(buf[:0])
-		if cur.qs != nil && cur.st != nil {
-			cur.st = cur.qs.pick()
-		}
-	}
-
-	sendPkt := func(pkt []byte) {
-		dst, ok := ipv4Dst(pkt)
-		if !ok {
-			return
-		}
-		ep, ok := pm.lookup(dst)
-		if !ok {
-			return
+	// ================= TX: TUN → UDP =================
+	{
+		N := clamp(pktLimit*2, 64, 512)
+		msgs := make([]ipv4.Message, N)
+		bufs := make([][]byte, N)
+		for i := 0; i < N; i++ {
+			bufs[i] = make([]byte, effMTU)
 		}
 
-		if cur.ep != "" && cur.ep != ep {
-			flushCur()
-			cur = batchAgg{}
+		flush := func(k int) {
+			if k > 0 {
+				_, _ = udp.pc.WriteBatch(msgs[:k], 0)
+			}
 		}
-		if cur.ep == "" {
-			qs, err := dialWithRetry(ctx, dc, ep, cfg.Transport.ALPN, cfg.Transport.Insecure, cfg.Transport.Streams, qconf)
-			if err != nil {
+
+		warmUntil := time.Now().Add(cfg.Batch.Warmup)
+		maxHold := cfg.Batch.Hold
+		k := 0
+		batchStart := time.Now()
+
+		pfd := []unix.PollFd{{Fd: int32(tun.fd), Events: unix.POLLIN}}
+		for {
+			// ожидаем данные на TUN с таймаутом, чтобы проверять ctx
+			_, _ = unix.Poll(pfd, 200) // мс
+			if ctx.Err() != nil {
+				flush(k)
 				return
 			}
-			qs.once.Do(func() { go serveQUICConn(qs.conn, tun, cfg.Tun.MTU) })
-			cur.ep, cur.qs, cur.st = ep, qs, qs.pick()
-			cur.b = batchPool.Get().([]byte)[:0]
-		}
-		need := 2 + len(pkt)
-		if len(cur.b)+need > cfg.Batch.Bytes {
-			flushCur()
-		}
-		var hdr [2]byte
-		binary.BigEndian.PutUint16(hdr[:], uint16(len(pkt)))
-		cur.b = append(cur.b, hdr[:]...)
-		cur.b = append(cur.b, pkt...)
-		// маленькие кадры — отправлять сразу для снижения задержек и ретраев
-		if len(pkt) <= 256 {
-			flushCur()
+
+			for k < N {
+				n, err := tun.ReadNB(bufs[k][:effMTU])
+				if err != nil {
+					flush(k)
+					return
+				}
+				if n == 0 { // нет данных сейчас
+					break
+				}
+				if n > effMTU {
+					continue
+				}
+				dst, ok := ipv4Dst(bufs[k][:n])
+				if !ok {
+					continue
+				}
+				ep, ok := pm.lookup(dst)
+				if !ok {
+					continue
+				}
+				addr, err := udp.raddr(ep)
+				if err != nil {
+					continue
+				}
+
+				msgs[k].Buffers = [][]byte{bufs[k][:n]}
+				msgs[k].Addr = addr
+				k++
+
+				if time.Now().Before(warmUntil) || k >= pktLimit || time.Since(batchStart) > maxHold {
+					break
+				}
+			}
+			flush(k)
+			k = 0
+			batchStart = time.Now()
 		}
 	}
+}
 
-	for {
-		select {
-		case <-ctx.Done():
-			flushCur()
-			slog.Info("shutdown by signal")
-			return
-		case <-flushTicker.C:
-			flushCur()
-		case pkt, ok := <-pktCh:
-			if !ok {
-				flushCur()
-				slog.Info("shutdown on tun close")
-				return
-			}
-			sendPkt(pkt)
-			rbufPool.Put(pkt[:0])
+// ============================ вспомогательные =========================
+
+func clamp(x, lo, hi int) int {
+	if x < lo {
+		return lo
+	}
+	if x > hi {
+		return hi
+	}
+	return x
+}
+
+func prewarmEndpoints(udp *udpState, pm *peerMap) {
+	eps := pm.endpoints()
+	if len(eps) == 0 {
+		return
+	}
+	const shots = 4
+	msgs := make([]ipv4.Message, 0, len(eps)*shots)
+	for _, ep := range eps {
+		addr, err := udp.raddr(ep)
+		if err != nil {
+			continue
 		}
+		for i := 0; i < shots; i++ {
+			msgs = append(msgs, ipv4.Message{Buffers: [][]byte{{0}}, Addr: addr})
+		}
+	}
+	for off := 0; off < len(msgs); {
+		n, _ := udp.pc.WriteBatch(msgs[off:], 0)
+		if n <= 0 {
+			break
+		}
+		off += n
 	}
 }

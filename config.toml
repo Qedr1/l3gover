@@ -1,46 +1,24 @@
-# /etc/sysctl.d/99-l3-overlay.conf
-#net.core.rmem_max     = 33554432   # максимум RX сокета; 32 MiB
-#net.core.wmem_max     = 33554432   # максимум TX сокета; 32 MiB
-#net.core.rmem_default = 8388608    # дефолт RX сокета; 8 MiB
-#net.core.wmem_default = 8388608    # дефолт TX сокета; 8 MiB
+# overlay.toml — конфиг для UDP L3-оверлея
 
-#net.ipv4.udp_rmem_min = 262144     # минимальный RX для UDP; 256 KiB
-#net.ipv4.udp_wmem_min = 262144     # минимальный TX для UDP; 256 KiB
-
-
-# настройки TUN-интерфейса
 [tun]
-name       = "tun0"             # имя интерфейса TUN; "tun0"
-addr       = "10.10.0.2/24"     # IPv4/CIDR адрес TUN; "10.10.0.1/24"
-link_mtu   = 1400               # MTU интерфейса TUN в ядре; 9000 под джамбо-кадры
-add_route  = true               # добавить маршрут своей подсети addr в TUN; true=да
-#gray_routes = [                 # дополнительные "серые" подсети, которые гнать в TUN
-#  "10.20.0.0/16",               # пример 1
-#  "10.30.0.0/24"                # пример 2
-#]
-mtu        = 1400               # размер пользовательского буфера IP; должен быть >= link_mtu
+name       = "tun0"            # имя TUN-интерфейса
+addr       = "10.10.0.2/24"    # IPv4 CIDR адрес на TUN
+link_mtu   = 9000              # MTU линка интерфейса; 9000 для jumbo
+add_route  = true              # добавить маршрут собственной подсети addr в TUN
+gray_routes = []               # дополнительные подсети, которые идут в TUN (массив CIDR)
+mtu        = 9000              # целевой MTU обработки пакетов в приложении; 9000
 
-# [transport] — сетевой транспорт QUIC поверх UDP
 [transport]
-listen     = "0.0.0.0:5555"      # локальный UDP-адрес сервера; порт 5555
-alpn       = "go-l3-overlay"     # идентификатор ALPN; должен совпадать у всех узлов
-insecure   = true                # клиент: пропуск проверки TLS-сертификата; true для self-signed
-streams    = 4                   # число клиентских стримов на peer; 4
-udp_rbuf   = 16777216            # размер UDP RX буфера сокета; 16 MiB (≈ достаточен до ~100 ms на 1G)
-udp_wbuf   = 16777216            # размер UDP TX буфера сокета; 16 MiB (симметрично)
-idle       = "10m"               # MaxIdleTimeout соединения; 10 минут
-keepalive  = "25s"               # период keepalive; 25 секунд; "0" отключает
+listen   = "0.0.0.0:5555"      # UDP адрес прослушивания (и отправки)
+udp_rbuf = 33554432            # размер RX буфера UDP сокета; 32 MiB
+udp_wbuf = 33554432            # размер TX буфера UDP сокета; 32 MiB
 
-# путь к мэппингу "серый IPv4 → белый host:port"
 [map]
-path = "peers.toml"             # файл мэппинга; абсолютный путь
+path = "peers.toml"            # путь к TOML-файлу мэппинга серый_IP → белый endpoint
 
-#  микробатч пакетов перед отправкой
 [batch]
-bytes = 131072                   # микробатч 128 KiB ≈ MTU(9K), не раздувает задержку
+hold   = "5ms"               # макс. удержание батча; 5 мс для низкой задержки
+warmup = "2s"                  # тёплый старт: в течение 2с флаш каждого пакета
 
-# [log] — уровень логов
 [log]
-level = "info"                  # уровень: debug|info|warn|error
-
-
+level = "info"                 # уровень логов: debug|info|warn|error
