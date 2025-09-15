@@ -41,6 +41,6 @@ bytes = 131072                   # микробатч 128 KiB ≈ MTU(9K), не 
 
 # [log] — уровень логов
 [log]
-level = "debug"                  # уровень: debug|info|warn|error
+level = "info"                  # уровень: debug|info|warn|error
 
 

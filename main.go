@@ -1,8 +1,3 @@
-//go:build linux
-
-// L3-оверлей через TUN и QUIC (UDP). Ленивая установка. Idle-разрыв.
-// Linux-only. IPv4-only. quic-go v0.54. Конфиг: TOML. Логи: slog.
-
 package main
 
 import (
@@ -36,40 +31,41 @@ import (
 	netlink "github.com/vishvananda/netlink"
 )
 
-// ======================= данные и их назначение =======================
+// ======================= конфиг и типы =======================
 
 type Config struct {
 	Tun struct {
-		Name       string   `toml:"name"`        // имя интерфейса
-		Addr       string   `toml:"addr"`        // IPv4 CIDR для интерфейса
-		LinkMTU    int      `toml:"link_mtu"`    // MTU интерфейса (>0 применить)
-		AddRoute   bool     `toml:"add_route"`   // добавить маршрут подсети Addr в TUN
-		GrayRoutes []string `toml:"gray_routes"` // дополнительные подсети → TUN
-		MTU        int      `toml:"mtu"`         // размер IP-буфера (576..65535)
+		Name       string   `toml:"name"`
+		Addr       string   `toml:"addr"`
+		LinkMTU    int      `toml:"link_mtu"`
+		AddRoute   bool     `toml:"add_route"`
+		GrayRoutes []string `toml:"gray_routes"`
+		MTU        int      `toml:"mtu"`
 	} `toml:"tun"`
 	Transport struct {
-		Listen    string        `toml:"listen"`    // UDP адрес сервера
-		ALPN      string        `toml:"alpn"`      // идентификатор ALPN
-		Insecure  bool          `toml:"insecure"`  // отключить проверку TLS на клиенте (всегда true)
-		Streams   int           `toml:"streams"`   // число стримов на peer
-		UDPRcv    int           `toml:"udp_rbuf"`  // размер UDP RX буфера
-		UDPSnd    int           `toml:"udp_wbuf"`  // размер UDP TX буфера
-		Idle      time.Duration `toml:"idle"`      // MaxIdleTimeout QUIC
-		KeepAlive time.Duration `toml:"keepalive"` // период keepalive (0=off)
+		Listen    string        `toml:"listen"`
+		ALPN      string        `toml:"alpn"`
+		Insecure  bool          `toml:"insecure"` // всегда true
+		Streams   int           `toml:"streams"`
+		UDPRcv    int           `toml:"udp_rbuf"`
+		UDPSnd    int           `toml:"udp_wbuf"`
+		Idle      time.Duration `toml:"idle"`
+		KeepAlive time.Duration `toml:"keepalive"`
 	} `toml:"transport"`
 	Map struct {
-		Path string `toml:"path"` // путь к TOML мэппингу
+		Path string `toml:"path"`
 	} `toml:"map"`
 	Batch struct {
-		Bytes int `toml:"bytes"` // лимит микробатча (0=10×MTU; минимум=MTU)
+		Bytes int           `toml:"bytes"`    // минимум=MTU
+		Flush time.Duration `toml:"flush_ms"` // период флеша
 	} `toml:"batch"`
 	Log struct {
-		Level string `toml:"level"` // debug|info|warn|error
+		Level string `toml:"level"`
 	} `toml:"log"`
 }
 
 type peersTOML struct {
-	Peers map[string]string `toml:"peers"` // "серый IPv4" = "белый host:port"
+	Peers map[string]string `toml:"peers"`
 }
 
 type tunDevice struct {
@@ -79,13 +75,10 @@ type tunDevice struct {
 
 type peerMap struct {
 	mu sync.RWMutex
-	m  map[uint32]string // IPv4 (BE u32) → "ip:port"
+	m  map[uint32]string
 }
 
-type streamState struct {
-	s  *quic.Stream
-	mu sync.Mutex
-}
+type streamState struct{ s *quic.Stream }
 
 type quicState struct {
 	conn *quic.Conn
@@ -106,6 +99,7 @@ type dialCache struct {
 
 type batchAgg struct {
 	ep string
+	qs *quicState
 	st *streamState
 	b  []byte
 }
@@ -174,14 +168,16 @@ func loadConfig(path string) (Config, error) {
 	if cfg.Transport.Idle == 0 {
 		cfg.Transport.Idle = 10 * time.Minute
 	}
-	// Всегда без валидации TLS на клиенте.
 	cfg.Transport.Insecure = true
-
+	// Батч по умолчанию: 256KiB и 10ms
 	if cfg.Batch.Bytes == 0 {
-		cfg.Batch.Bytes = 10 * cfg.Tun.MTU
+		cfg.Batch.Bytes = 256 << 10
 	}
 	if cfg.Batch.Bytes < cfg.Tun.MTU {
 		cfg.Batch.Bytes = cfg.Tun.MTU
+	}
+	if cfg.Batch.Flush == 0 {
+		cfg.Batch.Flush = 10 * time.Millisecond
 	}
 	if cfg.Map.Path == "" {
 		cfg.Map.Path = "peers.toml"
@@ -390,21 +386,6 @@ func ipv4Dst(pkt []byte) ([]byte, bool) {
 	return pkt[16:20], true
 }
 
-func ipv4Src(pkt []byte) ([]byte, bool) {
-	if len(pkt) < 20 {
-		return nil, false
-	}
-	vihl := pkt[0]
-	if vihl>>4 != 4 {
-		return nil, false
-	}
-	ihl := int(vihl&0x0F) * 4
-	if ihl < 20 || len(pkt) < ihl {
-		return nil, false
-	}
-	return pkt[12:16], true
-}
-
 // ============================= QUIC state ============================
 
 func (qs *quicState) pick() *streamState {
@@ -449,7 +430,6 @@ func (dc *dialCache) getOrDial(ctx context.Context, endpoint, alpn string, insec
 		return qs, nil
 	}
 	dc.mu.RUnlock()
-
 	if dc.closing.Load() {
 		return nil, errors.New("dial cache closing")
 	}
@@ -461,12 +441,7 @@ func (dc *dialCache) getOrDial(ctx context.Context, endpoint, alpn string, insec
 	if err != nil {
 		return nil, err
 	}
-	tlsConf := &tls.Config{
-		NextProtos:         []string{alpn},
-		InsecureSkipVerify: insecure, // всегда true
-		ServerName:         host,
-		MinVersion:         tls.VersionTLS13,
-	}
+	tlsConf := &tls.Config{NextProtos: []string{alpn}, InsecureSkipVerify: insecure, ServerName: host, MinVersion: tls.VersionTLS13}
 	raddr, err := net.ResolveUDPAddr("udp", endpoint)
 	if err != nil {
 		return nil, err
@@ -520,10 +495,7 @@ func (dc *dialCache) registerIncomingConn(endpoint string, conn *quic.Conn, stre
 	}
 	dc.m[endpoint] = qs
 	dc.mu.Unlock()
-	go func() {
-		<-conn.Context().Done()
-		dc.drop(endpoint)
-	}()
+	go func() { <-conn.Context().Done(); dc.drop(endpoint) }()
 	return qs
 }
 
@@ -559,9 +531,7 @@ func (dc *dialCache) drop(endpoint string) {
 	}
 	qs.dead.Store(true)
 	for i := range qs.ss {
-		qs.ss[i].mu.Lock()
 		_ = qs.ss[i].s.Close()
-		qs.ss[i].mu.Unlock()
 	}
 	_ = qs.conn.CloseWithError(0, "drop")
 }
@@ -574,16 +544,13 @@ func (dc *dialCache) close() {
 	m := dc.m
 	dc.m = make(map[string]*quicState)
 	dc.mu.Unlock()
-
 	if pc != nil {
 		_ = pc.Close()
 	}
 	for _, qs := range m {
 		qs.dead.Store(true)
 		for i := range qs.ss {
-			qs.ss[i].mu.Lock()
 			_ = qs.ss[i].s.Close()
-			qs.ss[i].mu.Unlock()
 		}
 		_ = qs.conn.CloseWithError(0, "shutdown")
 	}
@@ -591,8 +558,6 @@ func (dc *dialCache) close() {
 
 // ============================ TLS/QUIC cfg ============================
 
-// QUIC-сервер обязан иметь сертификат. Генерируем эфемерный self-signed.
-// Клиент его не валидирует (insecure=true).
 func generateServerTLS(alpn string) (*tls.Config, error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -600,10 +565,8 @@ func generateServerTLS(alpn string) (*tls.Config, error) {
 	}
 	serial, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
 	tmpl := x509.Certificate{
-		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: "go-l3-overlay"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		SerialNumber: serial, Subject: pkix.Name{CommonName: "go-l3-overlay"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
@@ -618,18 +581,14 @@ func generateServerTLS(alpn string) (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{alpn},
-		MinVersion:   tls.VersionTLS13,
-	}, nil
+	return &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{alpn}, MinVersion: tls.VersionTLS13}, nil
 }
 
 func quicConfig(idle, keepalive time.Duration) *quic.Config {
 	cfg := &quic.Config{
 		MaxIdleTimeout:                 idle,
-		InitialStreamReceiveWindow:     8 << 20,
-		InitialConnectionReceiveWindow: 32 << 20,
+		InitialStreamReceiveWindow:     32 << 20,
+		InitialConnectionReceiveWindow: 128 << 20,
 	}
 	if keepalive > 0 {
 		cfg.KeepAlivePeriod = keepalive
@@ -664,15 +623,6 @@ func serveQUICConn(conn *quic.Conn, tun *tunDevice, mtu int) {
 				if ln <= 0 {
 					continue
 				}
-				if src, ok1 := ipv4Src(buf[:ln]); ok1 {
-					if dst, ok2 := ipv4Dst(buf[:ln]); ok2 {
-						slog.Debug("rx pkt", "remote", remote, "len", ln, "src", net.IP(src).String(), "dst", net.IP(dst).String())
-					} else {
-						slog.Debug("rx pkt", "remote", remote, "len", ln, "src", net.IP(src).String())
-					}
-				} else {
-					slog.Debug("rx pkt", "remote", remote, "len", ln)
-				}
 				if _, err := tun.Write(buf[:ln]); err != nil {
 					slog.Warn("tun write", "err", err)
 					return
@@ -696,24 +646,30 @@ func main() {
 		os.Exit(1)
 	}
 
+	// для throughput-замеров держим INFO
 	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(cfg.Log.Level)})
 	slog.SetDefault(slog.New(h))
 	slog.Info("start",
 		"listen", cfg.Transport.Listen, "alpn", cfg.Transport.ALPN, "streams", cfg.Transport.Streams,
 		"udp_rbuf", cfg.Transport.UDPRcv, "udp_wbuf", cfg.Transport.UDPSnd,
-		"mtu", cfg.Tun.MTU, "batch_bytes", cfg.Batch.Bytes, "tun", cfg.Tun.Name,
-		"insecure", cfg.Transport.Insecure,
+		"mtu", cfg.Tun.MTU, "batch_bytes", cfg.Batch.Bytes, "batch_flush", cfg.Batch.Flush,
+		"tun", cfg.Tun.Name, "insecure", cfg.Transport.Insecure,
 	)
 
+	// Пулы
 	var batchPool sync.Pool
 	batchPool.New = func() any { return make([]byte, 0, cfg.Batch.Bytes) }
+	var rbufPool sync.Pool
+	rbufPool.New = func() any { return make([]byte, cfg.Tun.MTU) }
 
+	// Маппинг
 	pm := newPeerMap()
 	if err := pm.loadFromTOML(cfg.Map.Path); err != nil {
 		slog.Error("map load", "err", err)
 		os.Exit(1)
 	}
 
+	// TUN
 	tun, err := openTUN(cfg.Tun.Name)
 	if err != nil {
 		slog.Error("tun open", "err", err)
@@ -729,6 +685,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	// UDP
 	laddr, err := net.ResolveUDPAddr("udp", cfg.Transport.Listen)
 	if err != nil {
 		slog.Error("resolve listen", "err", err)
@@ -743,13 +700,13 @@ func main() {
 	_ = udpConn.SetReadBuffer(cfg.Transport.UDPRcv)
 	_ = udpConn.SetWriteBuffer(cfg.Transport.UDPSnd)
 
-	srvTLS, err := generateServerTLS(cfg.Transport.ALPN) // эфемерный cert для QUIC
+	// QUIC
+	srvTLS, err := generateServerTLS(cfg.Transport.ALPN)
 	if err != nil {
 		slog.Error("tls", "err", err)
 		os.Exit(1)
 	}
 	qconf := quicConfig(cfg.Transport.Idle, cfg.Transport.KeepAlive)
-
 	listener, err := quic.Listen(udpConn, srvTLS, qconf)
 	if err != nil {
 		slog.Error("quic listen", "err", err)
@@ -764,7 +721,6 @@ func main() {
 	defer stop()
 	go func() { <-ctx.Done(); _ = listener.Close(); _ = tun.Close(); dc.close() }()
 
-	// входящие соединения
 	go func() {
 		for {
 			conn, err := listener.Accept(ctx)
@@ -782,7 +738,6 @@ func main() {
 		}
 	}()
 
-	// проактивные подключения ко всем endpoint
 	for _, ep := range pm.endpoints() {
 		ep := ep
 		go func() {
@@ -807,73 +762,80 @@ func main() {
 		}()
 	}
 
-	// автоёмкость канала: ≈ 4×batch в MTU-пакетах, границы [64..4096]
 	pktCap := clamp((cfg.Batch.Bytes/cfg.Tun.MTU)*4, 64, 4096)
 	pktCh := make(chan []byte, pktCap)
-	slog.Info("pkt channel", "cap", pktCap, "mtu", cfg.Tun.MTU, "batch_bytes", cfg.Batch.Bytes)
+	slog.Info("pkt channel", "cap", pktCap)
 
-	// таймерный флеш микробатча
-	const flushEvery = 10 * time.Millisecond
-	flushTicker := time.NewTicker(flushEvery)
+	flushTicker := time.NewTicker(cfg.Batch.Flush)
 	defer flushTicker.Stop()
 
-	// чтение из TUN → канал
+	// RX TUN → канал
 	go func() {
 		defer close(pktCh)
 		for {
-			buf := make([]byte, cfg.Tun.MTU)
-			n, err := tun.Read(buf)
+			b := rbufPool.Get().([]byte)
+			if cap(b) < cfg.Tun.MTU {
+				b = make([]byte, cfg.Tun.MTU)
+			}
+			n, err := tun.Read(b[:cfg.Tun.MTU])
 			if err != nil {
 				if ctx.Err() == nil && !errors.Is(err, syscall.EINTR) {
 					slog.Error("tun read", "err", err)
 				}
 				return
 			}
-			pktCh <- buf[:n]
+			pktCh <- b[:n]
 		}
 	}()
 
-	// батч-состояние
-	var batchPoolMu sync.Mutex
 	var cur batchAgg
-	flushCur := func() {
-		if len(cur.b) > 0 && cur.st != nil {
-			ep := cur.ep
-			st := cur.st
-			buf := cur.b
-			cur = batchAgg{}
-			st.mu.Lock()
-			_, err := st.s.Write(buf)
-			st.mu.Unlock()
-			// возврат буфера в пул
-			batchPoolMu.Lock()
-			batchPool.Put(buf[:0])
-			batchPoolMu.Unlock()
-			if err != nil {
-				slog.Warn("batch send", "endpoint", ep, "err", err)
-				dc.drop(ep)
-			} else {
-				slog.Debug("tx batch", "endpoint", ep, "bytes", len(buf))
+
+	// запись батча; при ошибке — мягкий recovery на новом стриме
+	writeBatch := func(buf []byte) {
+		// попытка записи
+		if _, err := cur.st.s.Write(buf); err != nil {
+			// если conn жив, пробуем новый стрим и однократный повтор
+			if cur.qs != nil && cur.qs.conn.Context().Err() == nil {
+				if ns, e2 := cur.qs.conn.OpenStreamSync(context.Background()); e2 == nil {
+					cur.st = &streamState{s: ns}
+					if _, e3 := cur.st.s.Write(buf); e3 == nil {
+						return
+					}
+				}
 			}
+			// conn мёртв — дропаем
+			slog.Warn("batch send", "endpoint", cur.ep, "err", err)
+			dc.drop(cur.ep)
+			cur = batchAgg{}
 		}
 	}
 
-	// отправка одного IP-пакета
+	flushCur := func() {
+		if len(cur.b) == 0 || cur.st == nil {
+			return
+		}
+		buf := cur.b
+		cur.b = batchPool.Get().([]byte)[:0]
+		writeBatch(buf)
+		batchPool.Put(buf[:0])
+		if cur.qs != nil && cur.st != nil {
+			cur.st = cur.qs.pick()
+		}
+	}
+
 	sendPkt := func(pkt []byte) {
-		dst, okd := ipv4Dst(pkt)
-		src, oks := ipv4Src(pkt)
-		if !okd || !oks {
+		dst, ok := ipv4Dst(pkt)
+		if !ok {
 			return
 		}
 		ep, ok := pm.lookup(dst)
 		if !ok {
-			slog.Debug("tx drop: no peer", "src", net.IP(src).String(), "dst", net.IP(dst).String())
 			return
 		}
-		slog.Debug("tx pkt", "ep", ep, "len", len(pkt), "src", net.IP(src).String(), "dst", net.IP(dst).String())
 
 		if cur.ep != "" && cur.ep != ep {
 			flushCur()
+			cur = batchAgg{}
 		}
 		if cur.ep == "" {
 			qs, err := dialWithRetry(ctx, dc, ep, cfg.Transport.ALPN, cfg.Transport.Insecure, cfg.Transport.Streams, qconf)
@@ -881,33 +843,23 @@ func main() {
 				return
 			}
 			qs.once.Do(func() { go serveQUICConn(qs.conn, tun, cfg.Tun.MTU) })
-			cur.ep = ep
-			cur.st = qs.pick()
-			batchPoolMu.Lock()
+			cur.ep, cur.qs, cur.st = ep, qs, qs.pick()
 			cur.b = batchPool.Get().([]byte)[:0]
-			batchPoolMu.Unlock()
 		}
 		need := 2 + len(pkt)
 		if len(cur.b)+need > cfg.Batch.Bytes {
 			flushCur()
-			qs, err := dialWithRetry(ctx, dc, ep, cfg.Transport.ALPN, cfg.Transport.Insecure, cfg.Transport.Streams, qconf)
-			if err != nil {
-				return
-			}
-			qs.once.Do(func() { go serveQUICConn(qs.conn, tun, cfg.Tun.MTU) })
-			cur.ep = ep
-			cur.st = qs.pick()
-			batchPoolMu.Lock()
-			cur.b = batchPool.Get().([]byte)[:0]
-			batchPoolMu.Unlock()
 		}
 		var hdr [2]byte
 		binary.BigEndian.PutUint16(hdr[:], uint16(len(pkt)))
 		cur.b = append(cur.b, hdr[:]...)
 		cur.b = append(cur.b, pkt...)
+		// маленькие кадры — отправлять сразу для снижения задержек и ретраев
+		if len(pkt) <= 256 {
+			flushCur()
+		}
 	}
 
-	// основной цикл
 	for {
 		select {
 		case <-ctx.Done():
@@ -923,6 +875,7 @@ func main() {
 				return
 			}
 			sendPkt(pkt)
+			rbufPool.Put(pkt[:0])
 		}
 	}
 }
