@@ -6,13 +6,13 @@ addr       = "10.10.0.2/24"    # IPv4 CIDR адрес на TUN
 #link_mtu   = 9000              # MTU линка интерфейса; 9000 для jumbo
 add_route  = true              # добавить маршрут собственной подсети addr в TUN
 gray_routes = []               # дополнительные подсети, которые идут в TUN (массив CIDR)
-mtu        = 9000              # целевой MTU обработки пакетов в приложении; 9000
+mtu        = 65000              # целевой MTU обработки пакетов в приложении; 9000
 
 [transport]
 listen   = "0.0.0.0:5555"      # UDP адрес прослушивания (и отправки)
 udp_rbuf = 33554432            # размер RX буфера UDP сокета; 32 MiB
 udp_wbuf = 33554432            # размер TX буфера UDP сокета; 32 MiB
-zerocopy = false
+zerocopy = true
 
 [map]
 path = "conf/peers.toml"        # путь к TOML-файлу мэппинга серый_IP → белый endpoint
