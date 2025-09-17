@@ -474,7 +474,7 @@ func newUDP(listen string, rcv, snd int, zerocopy bool, zcMin, udpgsoMSS int, ag
 	if zerocopy && fd > 0 {
 		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ZEROCOPY, 1); err == nil {
 			u.zerocp = true
-			slog.Info("zerocopy on")
+			slog.Debug("zerocopy on")
 		} else {
 			slog.Warn("zerocopy off", "err", err)
 		}
@@ -713,7 +713,7 @@ func main() {
 	}
 	effMTU := cfg.Tun.MTU
 	if effMTU > maxInner {
-		slog.Warn("eff_mtu clamped by link_mtu-28",
+		slog.Debug("eff_mtu clamped by link_mtu-28",
 			"requested_mtu", cfg.Tun.MTU, "link_mtu", linkMTU, "outer_overhead", outerOverhead, "new_eff_mtu", maxInner)
 		effMTU = maxInner
 	}
@@ -726,7 +726,7 @@ func main() {
 			if err := netlink.LinkSetMTU(link, effMTU); err != nil {
 				slog.Warn("lower link_mtu failed", "want", effMTU, "err", err)
 			} else {
-				slog.Info("lower link_mtu to eff_mtu", "old", linkMTU, "new", effMTU)
+				slog.Debug("lower link_mtu to eff_mtu", "old", linkMTU, "new", effMTU)
 				linkMTU = effMTU
 			}
 		}
@@ -754,7 +754,7 @@ func main() {
 	pktLimitRX := clamp(targetBatchBytesRX/effMTU, 1, 2048)
 	pktLimitTX := clamp(targetBatchBytesTX/effMTU, 1, 2048)
 
-	slog.Info("start",
+	slog.Debug("Starting...",
 		"listen", cfg.Transport.Listen,
 		"udp_rbuf_req", cfg.Transport.UDPRcv, "udp_wbuf_req", cfg.Transport.UDPSnd,
 		"udp_rbuf_act", udp.rcvSz, "udp_wbuf_act", udp.sndSz,
@@ -766,6 +766,8 @@ func main() {
 		"udpgso_mss", cfg.Transport.UDPGSOMSS, "aggregate_inner", cfg.Transport.AggregateInn,
 		"tun", cfg.Tun.Name,
 	)
+
+	slog.Info("Service started", "tun", cfg.Tun.Name)
 
 	// Прогрев пиров.
 	prewarmEndpoints(udp, pm)
