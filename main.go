@@ -1,17 +1,14 @@
 //go:build linux
 
 // L3-оверлей через TUN и UDP. IPv4-only. Без шифрования.
+// Без virtio-net vnet_hdr: читаем и пишем в TUN чистые L3-пакеты (IFF_NO_PI).
 //
 // Производительность:
-// - TUN с IFF_VNET_HDR + TUNSETOFFLOAD (CSUM/TSO4/TSO6). Мы читаем/пишем virtio-net hdr.
-// - RX: ipv4.PacketConn.ReadBatch → запись в TUN (с vnet hdr), дедлайны от batch.hold.
-// - TX: чтение из TUN (vnet hdr) → UDP: копирующий батч WriteBatch или zerocopy SendmsgN.
-// - UDP_SEGMENT: ВКЛЮЧАЕТСЯ ТОЛЬКО ЕСЛИ Transport.udpgso_mss>0 И aggregate_inner=true.
-//   Иначе не используем (иначе сломает семантику «1 inner → 1 outer UDP»).
+// - RX: ipv4.PacketConn.ReadBatch → запись в TUN (L3).
+// - TX: чтение из TUN (L3) → отправка UDP: копирующий батч WriteBatch или zerocopy SendmsgN.
+// - UDP_SEGMENT: включается ТОЛЬКО если udpgso_mss > 0 и aggregate_inner = true.
 //
-// Внешние offload’ы: после запуска пробуем `ethtool -K tunX gro/gso/tso on`. Ошибки не критичны.
-//
-// Логи недоступности пира: warmup и tx, с троттлингом 5с/peer.
+// Логи недоступности пира: warmup и tx, троттлинг 5с/peer.
 
 package main
 
@@ -23,7 +20,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"runtime"
 	"strconv"
@@ -48,33 +44,31 @@ import (
 // Вход: TOML. Выход: валидированная структура с дефолтами.
 type Config struct {
 	Tun struct {
-		Name       string   `toml:"name"`         // имя TUN; "" → "tun0"
-		Addr       string   `toml:"addr"`         // IPv4 CIDR для TUN, напр. "10.10.0.1/24"
-		LinkMTU    int      `toml:"link_mtu"`     // MTU интерфейса; 0 → не менять (или взять из mtu)
-		AddRoute   bool     `toml:"add_route"`    // добавить маршрут своей подсети на TUN
-		GrayRoutes []string `toml:"gray_routes"`  // доп. IPv4 CIDR, направлять в TUN
-		MTU        int      `toml:"mtu"`          // целевой MTU inner; 0 → 9000
-		VNetHdr    bool     `toml:"vnet_hdr"`     // включить IFF_VNET_HDR (virtio-net header) для offload’ов TUN
-		Offloads   bool     `toml:"tun_offloads"` // выставить TUNSETOFFLOAD: CSUM/TSO4/TSO6
+		Name       string   `toml:"name"`        // имя TUN; "" → "tun0"
+		Addr       string   `toml:"addr"`        // IPv4 CIDR для TUN, напр. "10.10.0.1/24"
+		LinkMTU    int      `toml:"link_mtu"`    // MTU интерфейса; 0 → не менять (или взять из mtu)
+		AddRoute   bool     `toml:"add_route"`   // добавить маршрут своей подсети на TUN
+		GrayRoutes []string `toml:"gray_routes"` // доп. IPv4 CIDR, направлять в TUN
+		MTU        int      `toml:"mtu"`         // целевой MTU inner; 0 → 9000
 	} `toml:"tun"`
 	Transport struct {
 		Listen       string `toml:"listen"`          // UDP bind "ip:port"; "" → "0.0.0.0:5555"
-		UDPRcv       int    `toml:"udp_rbuf"`        // RX-буфер сокета; 0 → 32MiB
-		UDPSnd       int    `toml:"udp_wbuf"`        // TX-буфер сокета; 0 → 32MiB
-		ZeroCopy     bool   `toml:"zerocopy"`        // SO_ZEROCOPY
+		UDPRcv       int    `toml:"udp_rbuf"`        // запрошенный SO_RCVBUF; 0 → 32MiB
+		UDPSnd       int    `toml:"udp_wbuf"`        // запрошенный SO_SNDBUF; 0 → 32MiB
+		ZeroCopy     bool   `toml:"zerocopy"`        // включить SO_ZEROCOPY
 		ZCMinBytes   int    `toml:"zc_min_bytes"`    // порог для zerocopy; 0 → 8192
-		UDPGSOMSS    int    `toml:"udpgso_mss"`      // MSS для UDP_SEGMENT; 0 → выкл (без агрегации использовать нельзя)
-		AggregateInn bool   `toml:"aggregate_inner"` // агрегировать несколько inner в один outer UDP (эксперимент, по умолчанию false)
+		UDPGSOMSS    int    `toml:"udpgso_mss"`      // MSS для UDP_SEGMENT; 0 → выкл
+		AggregateInn bool   `toml:"aggregate_inner"` // агрегировать несколько inner в один outer UDP
 	} `toml:"transport"`
 	Map struct {
-		Path string `toml:"path"` // путь к мэппингу серый_IP → "белый ip:port"; "" → "conf/peers.toml"
+		Path string `toml:"path"` // путь к мэппингу: серый_IP → "белый ip:port"; "" → "conf/peers.toml"
 	} `toml:"map"`
 	Batch struct {
 		Hold   time.Duration `toml:"hold"`   // макс удержание TX-батча и шаг опроса; 0 → 5ms
 		Warmup time.Duration `toml:"warmup"` // длительность прогрева; 0 → 2s
 	} `toml:"batch"`
 	Log struct {
-		Level string `toml:"level"` // уровень логов: debug|info|warn|error; "" → info
+		Level string `toml:"level"` // debug|info|warn|error; "" → info
 	} `toml:"log"`
 }
 
@@ -83,30 +77,10 @@ type peersTOML struct {
 	Peers map[string]string `toml:"peers"`
 }
 
-// virtioNetHdr — заголовок virtio-net для vnet_hdr (минимальный).
-// Используем «без mergeable buffers»; num_buffers=0.
-type virtioNetHdr struct {
-	Flags     uint8  // VIRTIO_NET_HDR_F_*
-	GSOType   uint8  // VIRTIO_NET_HDR_GSO_*
-	HdrLen    uint16 // длина L2/L3/L4 hdr (для GSO)
-	GSOSize   uint16 // размер MSS для GSO
-	CSumStart uint16 // смещение начала псевдозаголовка
-	CSumOff   uint16 // смещение чек-суммы
-}
-
-// virtio-net константы (минимальный набор).
-const (
-	VIRTIO_NET_HDR_F_NEEDS_CSUM = 1
-	VIRTIO_NET_HDR_GSO_TCPV4    = 1
-	VIRTIO_NET_HDR_GSO_TCPV6    = 4
-)
-
-// tunDevice — дескриптор TUN + режим vnet_hdr.
+// tunDevice — дескриптор TUN (чистый L3, без vnet_hdr).
 // Потокобезопасность: запись делает одна горутина.
 type tunDevice struct {
-	fd         int
-	vnet       bool // если true — ожидаем/пишем virtio-net hdr
-	vnetHdrLen int  // длина virtio hdr (мы используем 10 байт, выровняем до 12)
+	fd int // файловый дескриптор /dev/net/tun
 }
 
 // peerMap — неизменяемая карта серый_IP→endpoint под atomic.Value.
@@ -114,7 +88,7 @@ type peerMap struct {
 	v atomic.Value // map[uint32]string
 }
 
-// udpState — UDP-сокет и кэш адресов.
+// udpState — UDP-сокет, кэш адресов, фактические размеры сокетных буферов.
 type udpState struct {
 	conn   *net.UDPConn
 	pc     *ipv4.PacketConn
@@ -122,8 +96,11 @@ type udpState struct {
 	zerocp bool
 	zcMin  int
 
-	udpgsoMSS int  // MSS для UDP_SEGMENT (если >0)
-	aggInner  bool // агрегировать inner (в противном случае UDP_SEGMENT не используется)
+	udpgsoMSS int  // MSS для UDP_SEGMENT
+	aggInner  bool // агрегировать inner
+
+	rcvSz int // фактический SO_RCVBUF
+	sndSz int // фактический SO_SNDBUF
 
 	mu  sync.RWMutex
 	r4  map[string]*net.UDPAddr
@@ -139,6 +116,7 @@ type udpState struct {
 //
 
 // parseLevel — строка уровня → slog.Level.
+// Вход: строка уровня. Выход: slog.Level.
 func parseLevel(s string) slog.Level {
 	switch strings.ToLower(s) {
 	case "debug":
@@ -155,6 +133,7 @@ func parseLevel(s string) slog.Level {
 }
 
 // loadConfig — загрузка TOML и дефолты.
+// Вход: путь к файлу. Выход: Config или ошибка.
 func loadConfig(path string) (Config, error) {
 	var cfg Config
 	if _, err := toml.DecodeFile(path, &cfg); err != nil {
@@ -193,7 +172,8 @@ func loadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
-// clamp — ограничение x в [lo,hi].
+// clamp — ограничить x в [lo,hi].
+// Вход: x, lo, hi. Выход: значение в пределах.
 func clamp(x, lo, hi int) int {
 	if x < lo {
 		return lo
@@ -205,6 +185,7 @@ func clamp(x, lo, hi int) int {
 }
 
 // rip4 — IPv4 → BE u32 ключ.
+// Вход: net.IP. Выход: uint32 (0 если не IPv4).
 func rip4(ip net.IP) uint32 {
 	b := ip.To4()
 	if b == nil {
@@ -217,23 +198,12 @@ func rip4(ip net.IP) uint32 {
 // ============================= TUN I/O ================================
 //
 
-// ioctl константы для TUN (отсутствующие в x/sys).
+// ioctl константы для TUN (без vnet_hdr/mergeable).
 const (
-	// базовые
 	iffTUN    = 0x0001
 	iffNO_PI  = 0x1000
-	iffVNET   = 0x4000 // IFF_VNET_HDR
 	IFNAMSIZ  = 16
 	TUNSETIFF = 0x400454ca
-
-	// offload
-	TUNSETOFFLOAD = 0x400454d0
-
-	// флаги TUNSETOFFLOAD
-	TUN_F_CSUM    = 0x01
-	TUN_F_TSO4    = 0x02
-	TUN_F_TSO6    = 0x04
-	TUN_F_TSO_ECN = 0x08
 )
 
 // ifreq — аргумент ioctl(TUNSETIFF).
@@ -243,9 +213,10 @@ type ifreq struct {
 	Pad   [22]byte
 }
 
-// openTUN — открыть /dev/net/tun, создать TUN, включить non-blocking и vnet_hdr.
-// Вход: name, vnetHdr(bool), setOffloads(bool). Выход: *tunDevice.
-func openTUN(name string, vnetHdr, setOffloads bool) (*tunDevice, error) {
+// openTUN — открыть /dev/net/tun, создать TUN и включить non-blocking.
+// Назначение: подготовить TUN для L3 без доп. заголовков.
+// Вход: name (строка интерфейса). Выход: *tunDevice или ошибка.
+func openTUN(name string) (*tunDevice, error) {
 	fd, err := syscall.Open("/dev/net/tun", syscall.O_RDWR, 0)
 	if err != nil {
 		return nil, errors.New("open /dev/net/tun: " + err.Error())
@@ -253,9 +224,6 @@ func openTUN(name string, vnetHdr, setOffloads bool) (*tunDevice, error) {
 	var req ifreq
 	copy(req.Name[:], name)
 	req.Flags = iffTUN | iffNO_PI
-	if vnetHdr {
-		req.Flags |= iffVNET
-	}
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(TUNSETIFF), uintptr(unsafe.Pointer(&req)))
 	if errno != 0 {
 		_ = syscall.Close(fd)
@@ -265,73 +233,31 @@ func openTUN(name string, vnetHdr, setOffloads bool) (*tunDevice, error) {
 		_ = syscall.Close(fd)
 		return nil, err
 	}
-
-	td := &tunDevice{fd: fd, vnet: vnetHdr, vnetHdrLen: 10}
-	// выровняем до 12 байт (общая практика для совместимости)
-	if td.vnetHdrLen%2 != 0 {
-		td.vnetHdrLen++
-	}
-	if setOffloads && vnetHdr {
-		// запросить offload’ы: CSUM + TSO4 + TSO6
-		flags := TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6 | TUN_F_TSO_ECN
-		_, _, e2 := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(TUNSETOFFLOAD), uintptr(unsafe.Pointer(&flags)))
-		if e2 != 0 {
-			slog.Warn("TUNSETOFFLOAD failed", "errno", e2)
-		} else {
-			slog.Info("TUNSETOFFLOAD on", "flags", flags)
-		}
-	}
-	return td, nil
+	return &tunDevice{fd: fd}, nil
 }
 
-// ReadNB — неблокирующее чтение кадра из TUN.
-// Возвращает длину полезной L3-части; если vnet_hdr включён — пропускаем virtio hdr.
+// ReadNB — неблокирующее чтение L3-пакета из TUN.
+// Вход: p — буфер (вмещает linkMTU). Выход: длина L3; 0 при EAGAIN; ошибка при сбое.
 func (t *tunDevice) ReadNB(p []byte) (int, error) {
 	n, err := syscall.Read(t.fd, p)
 	if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
 		return 0, nil
 	}
-	if err != nil {
-		return n, err
-	}
-	if !t.vnet {
-		return n, nil
-	}
-	if n < t.vnetHdrLen {
-		return 0, nil
-	}
-	// пропускаем virtio hdr
-	copy(p, p[t.vnetHdrLen:n])
-	return n - t.vnetHdrLen, nil
+	return n, err
 }
 
 // WriteL3 — запись L3-пакета в TUN.
-// Если vnet_hdr включён — предваряем virtio hdr нулями.
+// Вход: pkt — L3 пакет. Выход: число записанных байт или ошибка.
 func (t *tunDevice) WriteL3(pkt []byte) (int, error) {
-	if !t.vnet {
-		return syscall.Write(t.fd, pkt)
-	}
-	// формируем [virtio_hdr | pkt] без аллокаций: используем временный стековый буфер для hdr
-	var hdr [12]byte
-	// все поля 0 → без GSO/CSUM подсказок для ядра (минимальная совместимость)
-	// пишем сразу два iov: hdr и pkt.
-	iov := []syscall.Iovec{
-		{Base: &hdr[0], Len: uint64(t.vnetHdrLen)},
-		{Base: &pkt[0], Len: uint64(len(pkt))},
-	}
-	n, _, errno := syscall.Syscall(syscall.SYS_WRITEV, uintptr(t.fd), uintptr(unsafe.Pointer(&iov[0])), uintptr(len(iov)))
-	if errno != 0 {
-		return int(n), errno
-	}
-	// возвращаем длину L3 части
-	return int(n) - t.vnetHdrLen, nil
+	return syscall.Write(t.fd, pkt)
 }
 
-// Close — закрытие TUN.
+// Close — закрыть TUN.
+// Вход: нет. Выход: ошибка ОС (если была).
 func (t *tunDevice) Close() error { return syscall.Close(t.fd) }
 
 // configureTUN — поднять интерфейс, адрес/MTU, при необходимости маршрут.
-// Выход: фактический MTU линка.
+// Вход: name, cidr, linkMTU, addRoute. Выход: фактический MTU линка или ошибка.
 func configureTUN(name, cidr string, linkMTU int, addRoute bool) (int, error) {
 	link, err := netlink.LinkByName(name)
 	if err != nil {
@@ -371,6 +297,7 @@ func configureTUN(name, cidr string, linkMTU int, addRoute bool) (int, error) {
 }
 
 // addGrayRoutes — добавить маршруты доп. подсетей в TUN.
+// Вход: tunName, список CIDR. Выход: ошибка при парсинге/системных вызовах.
 func addGrayRoutes(tunName string, cidrs []string) error {
 	if len(cidrs) == 0 {
 		return nil
@@ -399,7 +326,8 @@ func addGrayRoutes(tunName string, cidrs []string) error {
 // ======================== Мэппинг адресов ========================
 //
 
-// newPeerMap — пустая атомарная карта.
+// newPeerMap — создать пустую атомарную карту.
+// Вход: нет. Выход: *peerMap.
 func newPeerMap() *peerMap {
 	pm := &peerMap{}
 	pm.v.Store(make(map[uint32]string))
@@ -407,6 +335,7 @@ func newPeerMap() *peerMap {
 }
 
 // loadFromTOML — загрузить мэппинг и атомарно заменить карту.
+// Вход: путь к TOML. Выход: ошибка при парсинге/валидации.
 func (pm *peerMap) loadFromTOML(path string) error {
 	var pf peersTOML
 	if _, err := toml.DecodeFile(path, &pf); err != nil {
@@ -436,6 +365,7 @@ func (pm *peerMap) loadFromTOML(path string) error {
 }
 
 // lookup — быстрый поиск endpoint по dst IPv4 без блокировок.
+// Вход: dstIPv4 — 4 байта адреса. Выход: endpoint и ok.
 func (pm *peerMap) lookup(dstIPv4 []byte) (string, bool) {
 	if len(dstIPv4) != 4 {
 		return "", false
@@ -447,6 +377,7 @@ func (pm *peerMap) lookup(dstIPv4 []byte) (string, bool) {
 }
 
 // endpoints — уникальные endpoints для прогрева.
+// Вход: нет. Выход: список уникальных "ip:port".
 func (pm *peerMap) endpoints() []string {
 	m := pm.v.Load().(map[uint32]string)
 	seen := make(map[string]struct{}, len(m))
@@ -466,6 +397,7 @@ func (pm *peerMap) endpoints() []string {
 //
 
 // ipv4Dst — извлечь dst IPv4 из заголовка IPv4-пакета.
+// Вход: pkt. Выход: срез pkt[16:20], ok.
 func ipv4Dst(pkt []byte) ([]byte, bool) {
 	if len(pkt) < 20 || pkt[0]>>4 != 4 {
 		return nil, false
@@ -481,7 +413,9 @@ func ipv4Dst(pkt []byte) ([]byte, bool) {
 // =============================== UDP ================================
 //
 
-// newUDP — создать UDP-сокет, включить опции, подготовить cmsg/zerocopy.
+// newUDP — создать UDP-сокет, задать опции, zerocopy и размеры буферов.
+// Вход: listen, rcv, snd, zerocopy, zcMin, udpgsoMSS, aggregate.
+// Выход: *udpState или ошибка.
 func newUDP(listen string, rcv, snd int, zerocopy bool, zcMin, udpgsoMSS int, aggregate bool) (*udpState, error) {
 	laddr, err := net.ResolveUDPAddr("udp", listen)
 	if err != nil {
@@ -491,8 +425,10 @@ func newUDP(listen string, rcv, snd int, zerocopy bool, zcMin, udpgsoMSS int, ag
 	if err != nil {
 		return nil, err
 	}
+	// запросить размеры буферов от конфигурации
 	_ = c.SetReadBuffer(rcv)
 	_ = c.SetWriteBuffer(snd)
+
 	pc := ipv4.NewPacketConn(c)
 
 	// сырой fd
@@ -513,18 +449,28 @@ func newUDP(listen string, rcv, snd int, zerocopy bool, zcMin, udpgsoMSS int, ag
 		rs4:       make(map[string]*unix.SockaddrInet4),
 		lastLog:   make(map[string]time.Time),
 		logCool:   5 * time.Second,
+		rcvSz:     rcv,
+		sndSz:     snd,
 	}
 
-	// IP_RECVERR для логов ICMP.
+	// прочитать фактические SO_RCVBUF/SO_SNDBUF (ядро может масштабировать)
+	if fd > 0 {
+		if sz, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF); err == nil {
+			u.rcvSz = sz
+		}
+		if sz, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF); err == nil {
+			u.sndSz = sz
+		}
+	}
+
+	// включить IP_RECVERR для чтения ICMP ошибок
 	if fd > 0 {
 		if err := unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_RECVERR, 1); err != nil {
 			slog.Warn("IP_RECVERR off", "err", err)
 		}
-	} else {
-		slog.Warn("IP_RECVERR off", "err", "no fd")
 	}
 
-	// SO_ZEROCOPY.
+	// SO_ZEROCOPY
 	if zerocopy && fd > 0 {
 		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ZEROCOPY, 1); err == nil {
 			u.zerocp = true
@@ -532,16 +478,16 @@ func newUDP(listen string, rcv, snd int, zerocopy bool, zcMin, udpgsoMSS int, ag
 		} else {
 			slog.Warn("zerocopy off", "err", err)
 		}
-	} else if zerocopy {
-		slog.Warn("zerocopy off", "err", "no fd")
 	}
 	return u, nil
 }
 
 // close — закрыть UDP.
+// Вход: нет. Выход: нет.
 func (u *udpState) close() { _ = u.pc.Close(); _ = u.conn.Close() }
 
 // raddr — разрешить endpoint и закешировать sockaddr.
+// Вход: ep "ip:port". Выход: *net.UDPAddr, *unix.SockaddrInet4, ошибка.
 func (u *udpState) raddr(ep string) (*net.UDPAddr, *unix.SockaddrInet4, error) {
 	u.mu.RLock()
 	if a, ok := u.r4[ep]; ok {
@@ -575,13 +521,15 @@ func (u *udpState) raddr(ep string) (*net.UDPAddr, *unix.SockaddrInet4, error) {
 }
 
 // setWarmupUntil — установить дедлайн прогрева.
+// Вход: t. Выход: нет.
 func (u *udpState) setWarmupUntil(t time.Time) {
 	u.mu.Lock()
 	u.warmupUntil = t
 	u.mu.Unlock()
 }
 
-// phase — текущая фаза: warmup/tx.
+// phase — текущая фаза: "warmup" или "tx".
+// Вход: нет. Выход: строка фазы.
 func (u *udpState) phase() string {
 	u.mu.RLock()
 	t := u.warmupUntil
@@ -593,6 +541,7 @@ func (u *udpState) phase() string {
 }
 
 // notePeerUnavailable — троттлинг сообщений об ошибках доставки.
+// Вход: ep, phase, reason, err. Выход: нет.
 func (u *udpState) notePeerUnavailable(ep, phase, reason string, err error) {
 	now := time.Now()
 	u.mu.Lock()
@@ -607,6 +556,7 @@ func (u *udpState) notePeerUnavailable(ep, phase, reason string, err error) {
 }
 
 // isTempSendErr — временные ошибки TX.
+// Вход: err. Выход: true если временная.
 func isTempSendErr(err error) bool {
 	if err == nil {
 		return false
@@ -625,6 +575,7 @@ func isTempSendErr(err error) bool {
 }
 
 // startErrMonitor — дренаж error-queue для логов ICMP.
+// Вход: ctx, tick. Выход: нет.
 func (u *udpState) startErrMonitor(ctx context.Context, tick time.Duration) {
 	if u.fd <= 0 {
 		return
@@ -665,6 +616,7 @@ func (u *udpState) startErrMonitor(ctx context.Context, tick time.Duration) {
 }
 
 // parseUDPEndpointFromICMPPayload — извлечь "dstIP:dstPort" из вложенного IPv4+UDP.
+// Вход: buf. Выход: endpoint, ok.
 func parseUDPEndpointFromICMPPayload(buf []byte) (string, bool) {
 	if len(buf) < 28 || buf[0]>>4 != 4 {
 		return "", false
@@ -687,10 +639,8 @@ func parseUDPEndpointFromICMPPayload(buf []byte) (string, bool) {
 //
 
 // buildUDPSegmentCMSG — построить cmsg UDP_SEGMENT на MSS байт.
-// Используется ТОЛЬКО при агрегации нескольких inner в один UDP.
+// Вход: mss. Выход: байты cmsg.
 func buildUDPSegmentCMSG(mss uint16) []byte {
-	// struct cmsghdr { size_t cmsg_len; int cmsg_level; int cmsg_type; ... }
-	// За cmsghdr следует u16 gso_size (native-endian), затем padding.
 	hlen := unix.CmsgSpace(2) // 2 байта данных
 	buf := make([]byte, hlen)
 	h := (*unix.Cmsghdr)(unsafe.Pointer(&buf[0]))
@@ -698,7 +648,6 @@ func buildUDPSegmentCMSG(mss uint16) []byte {
 	h.Type = unix.UDP_SEGMENT
 	h.SetLen(unix.CmsgLen(2))
 	data := buf[unix.CmsgLen(0):unix.CmsgLen(2)]
-	// native endian; Linux на x86 — LE.
 	binary.LittleEndian.PutUint16(data[:2], mss)
 	return buf
 }
@@ -710,6 +659,7 @@ func buildUDPSegmentCMSG(mss uint16) []byte {
 var cfgPath = flag.String("config", "overlay.toml", "путь к конфигу TOML")
 
 // main — инициализация, прогрев, запуск конвейеров.
+// Вход: флаги командной строки. Выход: код завершения процесса (через os.Exit).
 func main() {
 	flag.Parse()
 	runtime.GOMAXPROCS(0)
@@ -728,8 +678,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Открываем TUN c IFF_VNET_HDR и включаем TUNSETOFFLOAD при запросе.
-	tun, err := openTUN(cfg.Tun.Name, cfg.Tun.VNetHdr, cfg.Tun.Offloads)
+	// Открыть TUN (чистый L3).
+	tun, err := openTUN(cfg.Tun.Name)
 	if err != nil {
 		slog.Error("tun open", "err", err)
 		os.Exit(1)
@@ -740,7 +690,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Настраиваем линк/адрес/маршруты.
+	// Настройка линка/адреса/маршрутов.
 	reqLinkMTU := cfg.Tun.LinkMTU
 	if reqLinkMTU == 0 && cfg.Tun.MTU > 0 {
 		reqLinkMTU = cfg.Tun.MTU
@@ -754,9 +704,6 @@ func main() {
 		slog.Error("routes add", "err", err)
 		os.Exit(1)
 	}
-
-	// Внешние offload’ы для tunX: best-effort системные команды.
-	applyTunOffloadSys(cfg.Tun.Name)
 
 	// Эффективный MTU inner = min(cfg.MTU, link_mtu-28), clamp [576..].
 	const outerOverhead = 28
@@ -801,38 +748,43 @@ func main() {
 	}
 	udp.startErrMonitor(ctx, errqTick)
 
+	// Адаптивные батчи от фактических буферов сокета.
+	targetBatchBytesRX := clamp(udp.rcvSz/4, effMTU, 2<<20)
+	targetBatchBytesTX := clamp(udp.sndSz/4, effMTU, 2<<20)
+	pktLimitRX := clamp(targetBatchBytesRX/effMTU, 1, 2048)
+	pktLimitTX := clamp(targetBatchBytesTX/effMTU, 1, 2048)
+
 	slog.Info("start",
 		"listen", cfg.Transport.Listen,
-		"udp_rbuf", cfg.Transport.UDPRcv, "udp_wbuf", cfg.Transport.UDPSnd,
+		"udp_rbuf_req", cfg.Transport.UDPRcv, "udp_wbuf_req", cfg.Transport.UDPSnd,
+		"udp_rbuf_act", udp.rcvSz, "udp_wbuf_act", udp.sndSz,
+		"batch_bytes_rx", targetBatchBytesRX, "batch_bytes_tx", targetBatchBytesTX,
+		"pkt_limit_rx", pktLimitRX, "pkt_limit_tx", pktLimitTX,
 		"cfg_mtu", cfg.Tun.MTU, "link_mtu", linkMTU, "eff_mtu", effMTU,
 		"hold", cfg.Batch.Hold, "warmup", cfg.Batch.Warmup,
 		"zerocopy", cfg.Transport.ZeroCopy, "zc_min_bytes", cfg.Transport.ZCMinBytes,
 		"udpgso_mss", cfg.Transport.UDPGSOMSS, "aggregate_inner", cfg.Transport.AggregateInn,
-		"vnet_hdr", cfg.Tun.VNetHdr, "tun_offloads", cfg.Tun.Offloads,
 		"tun", cfg.Tun.Name,
 	)
 
 	// Прогрев пиров.
 	prewarmEndpoints(udp, pm)
 
-	// Размер батча.
-	const targetBatchBytes = 512 << 10 // 512 KiB
-	pktLimit := clamp(targetBatchBytes/effMTU, 1, 512)
+	// RX: UDP → TUN.
+	go rxLoop(ctx, udp, tun, effMTU, pktLimitRX, cfg.Batch.Hold)
 
-	// RX: UDP → TUN (пишем vnet_hdr при необходимости).
-	go rxLoop(ctx, udp, tun, effMTU, pktLimit, cfg.Batch.Hold)
-
-	// TX: TUN → UDP (читаем vnet_hdr, отправляем UDP).
-	txLoop(ctx, udp, pm, tun, linkMTU, effMTU, pktLimit, cfg.Batch.Hold, cfg.Batch.Warmup)
+	// TX: TUN → UDP.
+	txLoop(ctx, udp, pm, tun, linkMTU, effMTU, pktLimitTX, cfg.Batch.Hold, cfg.Batch.Warmup)
 }
 
 //
 // ============================ Конвейеры ===============================
 //
 
-// rxLoop — приём UDP батчами и запись в TUN (включая virtio hdr при необходимости).
+// rxLoop — приём UDP батчами и запись в TUN (L3).
+// Вход: ctx, udp, tun, effMTU, pktLimit, hold. Выход: нет.
 func rxLoop(ctx context.Context, udp *udpState, tun *tunDevice, effMTU, pktLimit int, hold time.Duration) {
-	N := clamp(pktLimit*2, 128, 1024)
+	N := clamp(pktLimit*2, 128, 4096)
 	msgs := make([]ipv4.Message, N)
 	bufs := make([][]byte, N)
 	for i := 0; i < N; i++ {
@@ -860,7 +812,6 @@ func rxLoop(ctx context.Context, udp *udpState, tun *tunDevice, effMTU, pktLimit
 			if ln <= 0 || ln > effMTU {
 				continue
 			}
-			// запишем L3 в TUN (функция сама добавит vnet_hdr при его включении)
 			if _, err := tun.WriteL3(bufs[i][:ln]); err != nil {
 				if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
 					continue
@@ -874,13 +825,11 @@ func rxLoop(ctx context.Context, udp *udpState, tun *tunDevice, effMTU, pktLimit
 }
 
 // txLoop — чтение из TUN и отправка UDP.
-// Если zerocopy=true и размер ≥ порога — SendmsgN(MSG_ZEROCOPY).
-// Копирующий путь — батч через WriteBatch без аллокаций на горячем пути.
-// UDP_SEGMENT включается ТОЛЬКО при aggregate_inner=true и udpgso_mss>0.
+// Вход: ctx, udp, pm, tun, linkMTU, effMTU, pktLimit, maxHold, warm. Выход: нет.
 func txLoop(ctx context.Context, udp *udpState, pm *peerMap, tun *tunDevice, linkMTU, effMTU, pktLimit int, maxHold, warm time.Duration) {
-	N := clamp(pktLimit*2, 128, 1024)
+	N := clamp(pktLimit*2, 128, 4096)
 
-	// Буферы чтения из TUN: N штук по linkMTU (+ место под vnet hdr в ReadNB не требуется — он срезается).
+	// Буферы чтения из TUN.
 	readBufs := make([][]byte, N)
 	for i := 0; i < N; i++ {
 		readBufs[i] = make([]byte, linkMTU)
@@ -904,7 +853,7 @@ func txLoop(ctx context.Context, udp *udpState, pm *peerMap, tun *tunDevice, lin
 
 	flushCopy := func() {
 		if k > 0 {
-			_, _ = udp.pc.WriteBatch(msgs[:k], 0)
+			_, _ = udp.pc.WriteBatch(msgs[:k], 0) // ошибки детектируем через error-queue
 			k = 0
 			batchStart = time.Now()
 		}
@@ -918,7 +867,6 @@ func txLoop(ctx context.Context, udp *udpState, pm *peerMap, tun *tunDevice, lin
 		}
 
 		for k < N {
-			// чтение из TUN (внутри ReadNB virtio hdr уже срезан при vnet_hdr=true)
 			n, err := tun.ReadNB(readBufs[k][:linkMTU])
 			if err != nil {
 				flushCopy()
@@ -947,10 +895,10 @@ func txLoop(ctx context.Context, udp *udpState, pm *peerMap, tun *tunDevice, lin
 				continue
 			}
 
-			// Zerocopy или копирующий путь.
+			// zerocopy или копирующий путь
 			useZC := udp.zerocp && len(pkt) >= udp.zcMin
 
-			// UDP_SEGMENT: используем ТОЛЬКО при агрегации нескольких inner в один outer.
+			// UDP_SEGMENT: только при агрегации.
 			var oob []byte
 			if udp.aggInner && udp.udpgsoMSS > 0 && len(pkt) > udp.udpgsoMSS {
 				oob = buildUDPSegmentCMSG(uint16(udp.udpgsoMSS))
@@ -968,7 +916,7 @@ func txLoop(ctx context.Context, udp *udpState, pm *peerMap, tun *tunDevice, lin
 				continue
 			}
 
-			// копирующий путь (батч)
+			// Копирующий путь (батч).
 			msgs[k].Buffers[0] = pkt
 			msgs[k].Addr = na
 			k++
@@ -987,6 +935,7 @@ func txLoop(ctx context.Context, udp *udpState, pm *peerMap, tun *tunDevice, lin
 //
 
 // prewarmEndpoints — прогрев пиров + явная проверка недоступности.
+// Вход: udp, pm. Выход: нет.
 func prewarmEndpoints(udp *udpState, pm *peerMap) {
 	eps := pm.endpoints()
 	if len(eps) == 0 {
@@ -1035,6 +984,7 @@ func prewarmEndpoints(udp *udpState, pm *peerMap) {
 }
 
 // isConnRefused — true, если ошибка соответствует ECONNREFUSED.
+// Вход: err. Выход: bool.
 func isConnRefused(err error) bool {
 	if err == nil {
 		return false
@@ -1048,14 +998,4 @@ func isConnRefused(err error) bool {
 		return isConnRefused(ne.Err)
 	}
 	return errors.Is(err, syscall.ECONNREFUSED)
-}
-
-// applyTunOffloadSys — best-effort включение gro/gso/tso на tunX через ethtool.
-// Выполняется после поднятия интерфейса. Ошибки некритичны.
-func applyTunOffloadSys(tunName string) {
-	// ethtool -K tunX gro on gso on tso on
-	cmd := exec.Command("ethtool", "-K", tunName, "gro", "on", "gso", "on", "tso", "on")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		slog.Warn("ethtool tun offload", "err", err, "out", string(out))
-	}
 }
