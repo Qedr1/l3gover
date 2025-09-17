@@ -1,15 +1,12 @@
-//go:build linux
-
 // L3-оверлей через TUN и UDP. IPv4-only. Без шифрования.
 // Основной путь: ipv4.PacketConn ReadBatch/WriteBatch.
 // Опция: SO_ZEROCOPY (SendmsgN + error-queue).
-// TUN в non-blocking + poll() → корректный выход по Ctrl+C.
-// Батч: лимит по времени и числу пакетов (~512 KiB / MTU), тёплый старт.
 
 package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"log/slog"
@@ -79,14 +76,8 @@ type peerMap struct {
 	m  map[uint32]string // IPv4 (BE u32) → "ip:port"
 }
 
-// peerStatus — короткий статус пира по сигналам из error-queue.
-type peerStatus struct {
-	LastErr string    // текстовый маркер причины
-	When    time.Time // момент фиксации
-}
-
-// udpState — UDP-сокет и кэш адресов. Поддержка SO_ZEROCOPY.
-// Потокобезопасность: адресные карты под RWMutex, TX делает одна горутина.
+// udpState — UDP-сокет, кэши адресов и контроль error-queue.
+// Потокобезопасность: карты под RWMutex, TX делает одна горутина.
 type udpState struct {
 	conn   *net.UDPConn
 	pc     *ipv4.PacketConn
@@ -96,9 +87,10 @@ type udpState struct {
 	fd     int
 	zerocp bool
 
-	// Индекс и статусы для прогрева/диагностики.
-	ip2eps map[string][]string   // "A.B.C.D" → список endpoint с таким dst IP
-	pstat  map[string]peerStatus // endpoint → статус
+	// Троттлинг логов "peer unavailable".
+	lastLog     map[string]time.Time // endpoint → ts последнего лога
+	logCool     time.Duration        // интервал троттлинга
+	warmupUntil time.Time            // до этого момента phase="warmup"
 }
 
 //
@@ -125,6 +117,7 @@ type ifreq struct {
 //
 
 // parseLevel — парсинг уровня логов.
+// Вход: строка. Выход: slog.Level.
 func parseLevel(s string) slog.Level {
 	switch strings.ToLower(s) {
 	case "debug":
@@ -141,6 +134,7 @@ func parseLevel(s string) slog.Level {
 }
 
 // loadConfig — загрузка TOML и дефолтизация.
+// Вход: путь. Выход: Config или ошибка.
 func loadConfig(path string) (Config, error) {
 	var cfg Config
 	if _, err := toml.DecodeFile(path, &cfg); err != nil {
@@ -168,7 +162,7 @@ func loadConfig(path string) (Config, error) {
 		cfg.Map.Path = "conf/peers.toml"
 	}
 	if cfg.Batch.Hold == 0 {
-		cfg.Batch.Hold = 5 * time.Millisecond
+		cfg.Batch.Hold = 5 * time.Millisecond //_CPU↓, задержка ≤0.5ms
 	}
 	if cfg.Batch.Warmup == 0 {
 		cfg.Batch.Warmup = 2 * time.Second
@@ -200,7 +194,7 @@ func rip4(ip net.IP) uint32 {
 // ============================= TUN I/O ================================
 //
 
-// openTUN — открыть /dev/net/tун, привязать имя, включить non-blocking.
+// openTUN — открыть /dev/net/tun, привязать имя, включить non-blocking.
 func openTUN(name string) (*tunDevice, error) {
 	fd, err := syscall.Open("/dev/net/tun", syscall.O_RDWR, 0)
 	if err != nil {
@@ -237,6 +231,7 @@ func (t *tunDevice) Write(p []byte) (int, error) { return syscall.Write(t.fd, p)
 func (t *tunDevice) Close() error { return syscall.Close(t.fd) }
 
 // configureTUN — поднять линк, адрес/MTU, при необходимости маршрут.
+// Вход: name, cidr, linkMTU, addRoute. Выход: фактический MTU или ошибка.
 func configureTUN(name, cidr string, linkMTU int, addRoute bool) (int, error) {
 	link, err := netlink.LinkByName(name)
 	if err != nil {
@@ -304,8 +299,10 @@ func addGrayRoutes(tunName string, cidrs []string) error {
 // ======================== Мэппинг адресов ========================
 //
 
+// newPeerMap — создать пустую таблицу.
 func newPeerMap() *peerMap { return &peerMap{m: make(map[uint32]string)} }
 
+// loadFromTOML — загрузить [peers], проверить и нормализовать адреса.
 func (pm *peerMap) loadFromTOML(path string) error {
 	var pf peersTOML
 	if _, err := toml.DecodeFile(path, &pf); err != nil {
@@ -368,6 +365,7 @@ func (pm *peerMap) endpoints() []string {
 // ============================= IPv4 utils ============================
 //
 
+// ipv4Dst — извлечь dst IPv4 из пакета.
 func ipv4Dst(pkt []byte) ([]byte, bool) {
 	if len(pkt) < 20 {
 		return nil, false
@@ -386,7 +384,7 @@ func ipv4Dst(pkt []byte) ([]byte, bool) {
 // =============================== UDP ================================
 //
 
-// newUDP — создать UDP сокет, включить IP_RECVERR и опционально SO_ZEROCOPY.
+// newUDP — создать UDP сокет, обёртку PacketConn, включить SO_ZEROCOPY и IP_RECVERR.
 func newUDP(listen string, rcv, snd int, zerocopy bool) (*udpState, error) {
 	laddr, err := net.ResolveUDPAddr("udp", listen)
 	if err != nil {
@@ -400,7 +398,7 @@ func newUDP(listen string, rcv, snd int, zerocopy bool) (*udpState, error) {
 	_ = c.SetWriteBuffer(snd)
 	pc := ipv4.NewPacketConn(c)
 
-	// сырой fd
+	// извлечь сырой fd
 	var fd int
 	if sc, err := c.SyscallConn(); err == nil {
 		_ = sc.Control(func(f uintptr) { fd = int(f) })
@@ -408,19 +406,19 @@ func newUDP(listen string, rcv, snd int, zerocopy bool) (*udpState, error) {
 
 	u := &udpState{
 		conn: c, pc: pc, fd: fd, zerocp: false,
-		r4:     make(map[string]*net.UDPAddr),
-		rs4:    make(map[string]*unix.SockaddrInet4),
-		ip2eps: make(map[string][]string),
-		pstat:  make(map[string]peerStatus),
+		r4:      make(map[string]*net.UDPAddr),
+		rs4:     make(map[string]*unix.SockaddrInet4),
+		lastLog: make(map[string]time.Time),
+		logCool: 5 * time.Second, // требуемый троттлинг логов
 	}
 
-	// Включаем IP_RECVERR для приёма ICMP ошибок в error-queue.
+	// Включаем приём ошибок IP (ICMP) в error-queue.
 	if fd > 0 {
 		if err := unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_RECVERR, 1); err != nil {
-			slog.Warn("ip_recverr off", "err", err)
+			slog.Warn("IP_RECVERR off", "err", err)
 		}
 	} else {
-		slog.Warn("ip_recverr off", "err", "no fd")
+		slog.Warn("IP_RECVERR off", "err", "no fd")
 	}
 
 	// SO_ZEROCOPY по запросу.
@@ -434,11 +432,6 @@ func newUDP(listen string, rcv, snd int, zerocopy bool) (*udpState, error) {
 	} else if zerocopy {
 		slog.Warn("zerocopy off", "err", "no fd")
 	}
-
-	// Монитор очереди ошибок: ICMP unreachable/route/port → помечаем пиры.
-	// Один воркер достаточно, завершится при закрытии fd.
-	go drainErrQueueAndMark(context.Background(), u)
-
 	return u, nil
 }
 
@@ -446,6 +439,7 @@ func newUDP(listen string, rcv, snd int, zerocopy bool) (*udpState, error) {
 func (u *udpState) close() { _ = u.pc.Close(); _ = u.conn.Close() }
 
 // raddr — разрешить endpoint и закешировать адреса.
+// Вход: "ip:port". Выход: *UDPAddr, *SockaddrInet4, ошибка.
 func (u *udpState) raddr(ep string) (*net.UDPAddr, *unix.SockaddrInet4, error) {
 	u.mu.RLock()
 	if a, ok := u.r4[ep]; ok {
@@ -472,7 +466,6 @@ func (u *udpState) raddr(ep string) (*net.UDPAddr, *unix.SockaddrInet4, error) {
 	copy(sa.Addr[:], rip.IP.To4())
 
 	u.mu.Lock()
-	// прямой кэш
 	if old, ok := u.r4[ep]; ok {
 		if rs2, ok2 := u.rs4[ep]; ok2 {
 			u.mu.Unlock()
@@ -488,91 +481,98 @@ func (u *udpState) raddr(ep string) (*net.UDPAddr, *unix.SockaddrInet4, error) {
 	return na, sa, nil
 }
 
-// indexEndpointIP — сохранить соответствие dst IP → endpoint для быстрых пометок.
-func (u *udpState) indexEndpointIP(ep, ip string) {
+// setWarmupUntil — установить дедлайн фазы прогрева для маркировки логов.
+func (u *udpState) setWarmupUntil(t time.Time) {
 	u.mu.Lock()
-	u.ip2eps[ip] = append(u.ip2eps[ip], ep)
+	u.warmupUntil = t
 	u.mu.Unlock()
 }
 
-// GetPeerStatus — отдать статус пира.
-func (u *udpState) GetPeerStatus(ep string) (peerStatus, bool) {
+// phase — "warmup" или "tx" по текущему времени.
+func (u *udpState) phase() string {
 	u.mu.RLock()
-	ps, ok := u.pstat[ep]
+	t := u.warmupUntil
 	u.mu.RUnlock()
-	return ps, ok
-}
-
-// DownPeers — список пиров, помеченных как down за период d.
-func (u *udpState) DownPeers(d time.Duration) []string {
-	cut := time.Now().Add(-d)
-	u.mu.RLock()
-	defer u.mu.RUnlock()
-	out := make([]string, 0, len(u.pstat))
-	for ep, st := range u.pstat {
-		if st.When.After(cut) {
-			out = append(out, ep)
-		}
+	if time.Now().Before(t) {
+		return "warmup"
 	}
-	return out
+	return "tx"
 }
 
-//
-// ======================= MSG_ERRQUEUE монитор =======================
-//
+// notePeerUnavailable — залогировать недоступность пира с троттлингом.
+// Вход: ep, phase, reason, err. Выход: нет.
+func (u *udpState) notePeerUnavailable(ep, phase, reason string, err error) {
+	now := time.Now()
+	u.mu.Lock()
+	last, ok := u.lastLog[ep]
+	if ok && now.Sub(last) < u.logCool {
+		u.mu.Unlock()
+		return
+	}
+	u.lastLog[ep] = now
+	u.mu.Unlock()
+	slog.Error("peer unavailable!", "peer", ep, "phase", phase, "reason", reason, "err", err)
+}
 
-// drainErrQueueAndMark — читает error-queue и помечает endpoint'ы по IP источника ошибки.
-// Примечание: для ICMP Unreachable адресом from обычно будет удалённый хост или промежуточный роутер.
-func drainErrQueueAndMark(ctx context.Context, u *udpState) {
+// startErrMonitor — запустить чтение error-queue (ICMP, zerocopy completion).
+// Вход: ctx. Выход: нет.
+func (u *udpState) startErrMonitor(ctx context.Context) {
 	if u.fd <= 0 {
 		return
 	}
-	oob := make([]byte, 1024)
-	dummy := make([]byte, 1)
-	pfd := []unix.PollFd{{Fd: int32(u.fd), Events: unix.POLLERR}}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		_, _ = unix.Poll(pfd, 1000) // мс
+	go func() {
+		oob := make([]byte, 512) // ctrl msgs
+		buf := make([]byte, 256) // payload: оригинальный IP+UDP
+		pfd := []unix.PollFd{{Fd: int32(u.fd), Events: unix.POLLERR}}
 		for {
-			n, oobn, _, from, err := unix.Recvmsg(u.fd, dummy, oob, unix.MSG_ERRQUEUE|unix.MSG_DONTWAIT)
-			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
-				break
-			}
-			if err != nil {
-				// fd закрыт или другая критика — выходим.
+			select {
+			case <-ctx.Done():
 				return
-			}
-			if n == 0 && oobn == 0 && from == nil {
-				break
-			}
-
-			// Определяем IP источника ошибки.
-			var ipStr string
-			switch a := from.(type) {
-			case *unix.SockaddrInet4:
-				ipStr = net.IP(a.Addr[:]).String()
 			default:
-				ipStr = ""
 			}
-			if ipStr == "" {
-				continue
+			_, _ = unix.Poll(pfd, 1000) // мс
+			for {
+				n, oobn, _, _, err := unix.Recvmsg(u.fd, buf, oob, unix.MSG_ERRQUEUE|unix.MSG_DONTWAIT)
+				if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+					break
+				}
+				if err != nil {
+					// сокет закрыт/EBADF → выходим
+					return
+				}
+				_ = oobn // ctrl данные не анализируем, достаточен payload
+				// Попытка извлечь endpoint из вложенного оригинального пакета.
+				if ep, ok := parseUDPEndpointFromICMPPayload(buf[:n]); ok {
+					u.notePeerUnavailable(ep, u.phase(), "icmp_unreachable", nil)
+				}
+				// Иначе просто дренируем сообщение, без лога.
 			}
-
-			// Помечаем все endpoint'ы с таким dst IP.
-			u.mu.Lock()
-			eps := u.ip2eps[ipStr]
-			now := time.Now()
-			for _, ep := range eps {
-				u.pstat[ep] = peerStatus{LastErr: "icmp_errqueue", When: now}
-				slog.Error("peer down", "endpoint", ep, "ip", ipStr, "reason", "icmp_errqueue")
-			}
-			u.mu.Unlock()
 		}
+	}()
+}
+
+// parseUDPEndpointFromICMPPayload — извлечь "ip:port" из payload ICMP (оригинальный IPv4+UDP).
+// Вход: buf (начало с оригинального IPv4). Выход: ep, ok.
+func parseUDPEndpointFromICMPPayload(buf []byte) (string, bool) {
+	if len(buf) < 28 {
+		return "", false
 	}
+	// Оригинальный IPv4
+	if buf[0]>>4 != 4 {
+		return "", false
+	}
+	ihl := int(buf[0]&0x0F) * 4
+	if ihl < 20 || len(buf) < ihl+4 {
+		return "", false
+	}
+	dstIP := net.IPv4(buf[16], buf[17], buf[18], buf[19]).String()
+	// Оригинальный UDP (первые 4 байта: src,dst порты)
+	udpOff := ihl
+	if len(buf) < udpOff+4 {
+		return "", false
+	}
+	dstPort := int(binary.BigEndian.Uint16(buf[udpOff+2 : udpOff+4]))
+	return net.JoinHostPort(dstIP, strconv.Itoa(dstPort)), true
 }
 
 //
@@ -608,6 +608,10 @@ func main() {
 	}
 	defer tun.Close()
 
+	// Контекст завершения. Прерывает блокирующие ожидания.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	// Если link_mtu не задан, применяем mtu как link MTU.
 	reqLinkMTU := cfg.Tun.LinkMTU
 	if reqLinkMTU == 0 && cfg.Tun.MTU > 0 {
@@ -625,11 +629,13 @@ func main() {
 	}
 
 	// Правило безфрагментационной инкапсуляции (IPv4+UDP = 28 байт):
+	// tun.mtu ≤ tun.link_mtu − 28
 	const outerOverhead = 28
 	maxInner := linkMTU - outerOverhead
 	if maxInner < 576 {
 		maxInner = 576
 	}
+
 	effMTU := cfg.Tun.MTU
 	if effMTU > maxInner {
 		slog.Warn("eff_mtu clamped by link_mtu-28",
@@ -640,12 +646,31 @@ func main() {
 		effMTU = 576
 	}
 
+	// Понизить link MTU до effMTU при необходимости.
+	if linkMTU > effMTU {
+		if link, err := netlink.LinkByName(cfg.Tun.Name); err == nil {
+			if err := netlink.LinkSetMTU(link, effMTU); err != nil {
+				slog.Warn("lower link_mtu failed", "want", effMTU, "err", err)
+			} else {
+				slog.Info("lower link_mtu to eff_mtu", "old", linkMTU, "new", effMTU)
+				linkMTU = effMTU
+			}
+		} else {
+			slog.Warn("lower link_mtu: link not found", "err", err)
+		}
+	}
+
 	udp, err := newUDP(cfg.Transport.Listen, cfg.Transport.UDPRcv, cfg.Transport.UDPSnd, cfg.Transport.ZeroCopy)
 	if err != nil {
 		slog.Error("udp listen", "err", err)
 		os.Exit(1)
 	}
 	defer udp.close()
+
+	// Метка фазы прогрева для логов.
+	udp.setWarmupUntil(time.Now().Add(cfg.Batch.Warmup))
+	// Мониторим error-queue: ICMP и завершения zerocopy.
+	udp.startErrMonitor(ctx)
 
 	slog.Info("start",
 		"listen", cfg.Transport.Listen,
@@ -656,11 +681,7 @@ func main() {
 		"tun", cfg.Tun.Name,
 	)
 
-	// Контекст завершения.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	// Прогрев: резолв, индексация IP→endpoint и мини-датаграммы для ARP/NAT/кэшей.
+	// Прогрев при старте: мини-датаграммы для ARP/NAT/кэшей.
 	prewarmEndpoints(udp, pm)
 
 	// Цель: крупный батч для снижения системных вызовов.
@@ -720,10 +741,10 @@ func main() {
 	{
 		N := clamp(pktLimit*2, 128, 1024)
 
-		// Общие буферы пакетов
+		// Читаем из TUN буфером linkMTU, чтобы не усекать пакет.
 		bufs := make([][]byte, N)
 		for i := 0; i < N; i++ {
-			bufs[i] = make([]byte, effMTU)
+			bufs[i] = make([]byte, linkMTU)
 		}
 
 		// Fallback batched через WriteBatch
@@ -752,7 +773,7 @@ func main() {
 			}
 
 			for k < N {
-				n, err := tun.ReadNB(bufs[k][:effMTU])
+				n, err := tun.ReadNB(bufs[k][:linkMTU])
 				if err != nil {
 					if k > 0 && !udp.zerocp {
 						sendBatchIPv4(k)
@@ -762,11 +783,14 @@ func main() {
 				if n == 0 {
 					break
 				}
+				// После понижения linkMTU ядро не даст >effMTU, но проверку оставим.
 				if n > effMTU {
+					slog.Warn("drop oversized inner packet", "len", n, "eff_mtu", effMTU, "link_mtu", linkMTU)
 					continue
 				}
 				pkt := bufs[k][:n]
 
+				// выбор endpoint по dst IPv4
 				dst, ok := ipv4Dst(pkt)
 				if !ok {
 					continue
@@ -777,19 +801,22 @@ func main() {
 				}
 				na, rsa, err := udp.raddr(ep)
 				if err != nil {
+					udp.notePeerUnavailable(ep, udp.phase(), "resolve_error", err)
 					continue
 				}
 
 				// Отправка
 				if udp.zerocp {
-					_, _ = unix.SendmsgN(udp.fd, pkt, nil, rsa, unix.MSG_ZEROCOPY)
+					if _, err := unix.SendmsgN(udp.fd, pkt, nil, rsa, unix.MSG_ZEROCOPY); err != nil {
+						udp.notePeerUnavailable(ep, udp.phase(), "send_error", err)
+					}
 				} else {
 					msgs[k].Buffers = [][]byte{pkt}
 					msgs[k].Addr = na
 				}
 				k++
 
-				// Тёплый старт: флашим чаще; иначе — по размерам/таймеру.
+				// тёплый старт: флашим чаще; иначе — по размерам/таймеру
 				if time.Now().Before(warmUntil) || k >= pktLimit || time.Since(batchStart) > maxHold {
 					break
 				}
@@ -808,8 +835,8 @@ func main() {
 // ============================ Вспомогательные =========================
 //
 
-// prewarmEndpoints — быстрый прогрев пиров (адресация/ARP/NAT) и построение индекса IP→endpoint.
-// Во время прогрева error-queue помечает недоступные пиры.
+// prewarmEndpoints — быстрый прогрев пиров (адресация/ARP/NAT).
+// Вход: udp, таблица пиров. Выход: нет. Логирует resolve_error с троттлингом.
 func prewarmEndpoints(udp *udpState, pm *peerMap) {
 	eps := pm.endpoints()
 	if len(eps) == 0 {
@@ -820,11 +847,9 @@ func prewarmEndpoints(udp *udpState, pm *peerMap) {
 	for _, ep := range eps {
 		na, _, err := udp.raddr(ep)
 		if err != nil {
+			udp.notePeerUnavailable(ep, "warmup", "resolve_error", err)
 			continue
 		}
-		// Индексация dst IP → endpoint для последующей корреляции в error-queue.
-		udp.indexEndpointIP(ep, na.IP.String())
-
 		for i := 0; i < shots; i++ {
 			msgs = append(msgs, ipv4.Message{
 				Buffers: [][]byte{{0}},
@@ -838,11 +863,5 @@ func prewarmEndpoints(udp *udpState, pm *peerMap) {
 			break
 		}
 		off += n
-	}
-
-	// Можно вывести краткий отчёт по down-пирам за окно прогрева.
-	down := udp.DownPeers(30 * time.Second)
-	if len(down) > 0 {
-		slog.Warn("prewarm: peers unreachable", "count", len(down), "peers", strings.Join(down, ","))
 	}
 }
