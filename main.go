@@ -157,7 +157,7 @@ func loadConfig(path string) (*Config, error) {
 		cfg.Transport.UDPSnd = 33554432
 	}
 	if cfg.Map.Path == "" {
-		cfg.Map.Path = "peers.toml"
+		cfg.Map.Path = "conf/peers.toml"
 	}
 	if cfg.Batch.Hold == 0 {
 		cfg.Batch.Hold = 2 * time.Millisecond //_CPU↓, задержка ≤2ms

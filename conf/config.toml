@@ -14,7 +14,7 @@ udp_rbuf = 33554432            # размер RX буфера UDP сокета; 
 udp_wbuf = 33554432            # размер TX буфера UDP сокета; 32 MiB
 
 [map]
-path = "peers.toml"            # путь к TOML-файлу мэппинга серый_IP → белый endpoint
+path = "conf/peers.toml"            # путь к TOML-файлу мэппинга серый_IP → белый endpoint
 
 [batch]
 hold   = "10ms"               # макс. удержание батча; 10мс для низкой задержки
