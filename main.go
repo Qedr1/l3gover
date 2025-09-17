@@ -132,35 +132,35 @@ func parseLevel(s string) slog.Level {
 }
 
 // loadConfig — загрузка TOML и дефолтизация.
-// Вход: путь. Выход: Config или ошибка.
-func loadConfig(path string) (Config, error) {
-	var cfg Config
-	if _, err := toml.DecodeFile(path, &cfg); err != nil {
-		return cfg, err
+// Вход: путь. Выход: *Config или ошибка.
+func loadConfig(path string) (*Config, error) {
+	cfg := &Config{}
+	if _, err := toml.DecodeFile(path, cfg); err != nil {
+		return nil, err
 	}
 	if cfg.Tun.Name == "" {
 		cfg.Tun.Name = "tun0"
 	}
 	if cfg.Tun.MTU == 0 {
-		cfg.Tun.MTU = 1500
+		cfg.Tun.MTU = 9000
 	}
 	if cfg.Tun.MTU < 576 || cfg.Tun.MTU > 65535 {
-		return cfg, errors.New("mtu вне диапазона")
+		return nil, errors.New("mtu вне диапазона")
 	}
 	if cfg.Transport.Listen == "" {
 		cfg.Transport.Listen = "0.0.0.0:5555"
 	}
 	if cfg.Transport.UDPRcv == 0 {
-		cfg.Transport.UDPRcv = 32 << 20
+		cfg.Transport.UDPRcv = 33554432
 	}
 	if cfg.Transport.UDPSnd == 0 {
-		cfg.Transport.UDPSnd = 32 << 20
+		cfg.Transport.UDPSnd = 33554432
 	}
 	if cfg.Map.Path == "" {
 		cfg.Map.Path = "peers.toml"
 	}
 	if cfg.Batch.Hold == 0 {
-		cfg.Batch.Hold = 400 * time.Microsecond //_CPU↓, задержка ≤0.5ms
+		cfg.Batch.Hold = 2 * time.Millisecond //_CPU↓, задержка ≤2ms
 	}
 	if cfg.Batch.Warmup == 0 {
 		cfg.Batch.Warmup = 2 * time.Second
@@ -235,54 +235,49 @@ func (t *tunDevice) Write(p []byte) (int, error) { return syscall.Write(t.fd, p)
 func (t *tunDevice) Close() error { return syscall.Close(t.fd) }
 
 // configureTUN — поднять линк, адрес/MTU, при необходимости маршрут.
-// Вход: name, cidr, linkMTU, addRoute. Выход: фактический MTU или ошибка.
-func configureTUN(name, cidr string, linkMTU int, addRoute bool) (int, error) {
+// Вход: name, cidr, linkMTU, addRoute. Выход: link, фактический MTU или ошибка.
+func configureTUN(name, cidr string, linkMTU int, addRoute bool) (netlink.Link, int, error) {
 	link, err := netlink.LinkByName(name)
 	if err != nil {
-		return 0, errors.New("link not found: " + err.Error())
+		return nil, 0, errors.New("link not found: " + err.Error())
 	}
 	if linkMTU > 0 {
 		if err := netlink.LinkSetMTU(link, linkMTU); err != nil {
-			return 0, errors.New("set mtu: " + err.Error())
+			return nil, 0, errors.New("set mtu: " + err.Error())
 		}
 	}
 	if err := netlink.LinkSetUp(link); err != nil {
-		return 0, errors.New("link up: " + err.Error())
+		return nil, 0, errors.New("link up: " + err.Error())
 	}
 	if cidr != "" {
 		ip, ipnet, err := net.ParseCIDR(cidr)
 		if err != nil {
-			return 0, errors.New("addr parse: " + err.Error())
+			return nil, 0, errors.New("addr parse: " + err.Error())
 		}
 		ip4 := ip.To4()
 		if ip4 == nil {
-			return 0, errors.New("IPv4 only")
+			return nil, 0, errors.New("IPv4 only")
 		}
 		addr := &netlink.Addr{IPNet: &net.IPNet{IP: ip4, Mask: ipnet.Mask}}
 		if err := netlink.AddrReplace(link, addr); err != nil {
-			return 0, errors.New("addr set: " + err.Error())
+			return nil, 0, errors.New("addr set: " + err.Error())
 		}
 		if addRoute {
 			dst := &net.IPNet{IP: ip4.Mask(ipnet.Mask), Mask: ipnet.Mask}
 			rt := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}
 			if err := netlink.RouteReplace(rt); err != nil {
-				return 0, errors.New("route add: " + err.Error())
+				return nil, 0, errors.New("route add: " + err.Error())
 			}
 		}
 	}
-	link, _ = netlink.LinkByName(name)
-	return link.Attrs().MTU, nil
+	return link, link.Attrs().MTU, nil
 }
 
 // addGrayRoutes — добавить маршруты доп. подсетей в TUN.
-// Вход: имя TUN, список CIDR. Выход: ошибка.
-func addGrayRoutes(tunName string, cidrs []string) error {
+// Вход: link, список CIDR. Выход: ошибка.
+func addGrayRoutes(link netlink.Link, cidrs []string) error {
 	if len(cidrs) == 0 {
 		return nil
-	}
-	link, err := netlink.LinkByName(tunName)
-	if err != nil {
-		return errors.New("link not found: " + err.Error())
 	}
 	for _, c := range cidrs {
 		_, ipnet, err := net.ParseCIDR(c)
@@ -547,12 +542,12 @@ func main() {
 	}
 	defer tun.Close()
 
-	linkMTU, err := configureTUN(cfg.Tun.Name, cfg.Tun.Addr, cfg.Tun.LinkMTU, cfg.Tun.AddRoute)
+	link, linkMTU, err := configureTUN(cfg.Tun.Name, cfg.Tun.Addr, cfg.Tun.LinkMTU, cfg.Tun.AddRoute)
 	if err != nil {
 		slog.Error("tun configure", "err", err)
 		os.Exit(1)
 	}
-	if err := addGrayRoutes(cfg.Tun.Name, cfg.Tun.GrayRoutes); err != nil {
+	if err := addGrayRoutes(link, cfg.Tun.GrayRoutes); err != nil {
 		slog.Error("routes add", "err", err)
 		os.Exit(1)
 	}
